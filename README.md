@@ -1,0 +1,243 @@
+# TPU Benchmark & SmolLM2-135M Inference on Milk-V Duo
+
+CV1800B (C906B @1GHz + C906L @700MHz) TPU/NPU benchmark toolkit and
+SmolLM2-135M dual-core inference engine.  Built on the
+[cvitek-tdl-sdk](https://github.com/milkv-duo/duo-buildroot-sdk).
+
+## Directory Layout
+
+```
+tpu_bench/
+├── common/                     # Shared headers
+│   ├── tpu_bench.h             #   TPU init / matmul / utility wrappers
+│   ├── mha_descriptor.h        #   Multihead-attention shared layout
+│   └── rtos_cmdqu.h            #   Mailbox command-queue userspace defs
+├── smollm2_pool_demo.c         # ★ Main inference: dual-core pipelined
+├── smollm2_demo.c              #   Legacy single-core inference
+├── convert_smollm2.py          # Convert HF weights → flat INT8 binary
+├── deploy_v2.py                # Deploy weights & binary to Duo over SSH
+├── smollm2_tokenize.py         # Tokenizer helper
+├── gen_rand_weights.c          # Generate random weights for testing
+├── gen_scales.py               # Generate quantization scales
+├── gen_report.py               # HTML report generator
+├── run_all.py                  # Run all micro-benchmarks
+├── Makefile                    # Cross-compilation rules
+├── transformer_demo.c          # FP32 transformer reference
+├── transformer.h               # Transformer block definitions
+├── mha_*.c                     # MHA attention variants (SD-card, LUT, etc.)
+├── 01_conv/ .. 07_pooling/     # TPU micro-benchmarks by operation
+└── SUMMARY.md                  # Historical development notes
+```
+
+## SmolLM2-135M Inference (`smollm2_pool_demo`)
+
+### Model config
+
+| Param | Value |
+|-------|-------|
+| d_model | 576 |
+| n_heads | 9 |
+| n_kv_heads | 3 |
+| head_dim | 64 |
+| n_layers | 30 |
+| ffn_hidden | 1536 |
+| vocab_size | 49152 |
+| Weight total | ~101 MB (INT8 + FP32 norms) |
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│                   Linux C906B @1GHz                   │
+│  ┌─────────┐   ┌──────────┐   ┌──────────────────┐   │
+│  │ SD Card │──▶│ DDR pool │──▶│ ION carveout     │   │
+│  │ weights │   │ 8 MB     │   │ 24 MB (TPU-visible)│   │
+│  │ embed   │   │ dual-buf │   │ embed cache +     │   │
+│  └─────────┘   │ staging  │   │ layer slots       │   │
+│                └──────────┘   └───────┬────────────┘   │
+│                                       │ TPU matmul     │
+│  ┌──────────────────────────────────┐ │                │
+│  │        Mailbox (0x01900000)      │ │                │
+│  └──────────────┬───────────────────┘ │                │
+└─────────────────┼─────────────────────┼────────────────┘
+                  │                     │
+┌─────────────────┼─────────────────────┼────────────────┐
+│          FreeRTOS C906L @700MHz       │                │
+│  ┌──────────────▼─────────────────────▼──────────────┐ │
+│  │  CMD_MHA_EMBED_XPOSE (0x28)                       │ │
+│  │  uint8 row-major → int8 col-major transpose       │ │
+│  └───────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────┘
+```
+
+### Memory layout (64 MB DDR)
+
+```
+Physical address space:
+  0x80000000 ──────────────────── DDR start (64 MB)
+  0x82473000 ──────────────────── neuron memory (1 MB, TPU work buffer)
+  0x82573000 ──────────────────── ION carveout (24 MB, TPU-visible)
+  0x83F40000 ──────────────────── FreeRTOS firmware (768 KB)
+  0x84000000 ──────────────────── DDR end
+
+ION layout (24 MB):
+  [embed cache: ~17.6 MB] [layer slot 0: 3.38 MB] [layer slot 1: 3.38 MB]
+   ↑ preserved across decode    ↑ alternating TPU compute targets
+   
+DDR layout (8 MB):
+  [ddr_buf[0]: ~3.5 MB] [ddr_buf[1]: ~3.5 MB] [io_buf: 256 KB]
+   ↑ current layer             ↑ next layer (SD pre-read)
+```
+
+### Dual-core pipeline
+
+```
+Layer loop (30 layers per token):
+  ┌─ SD read layer N+1 → ddr_buf[next]  ─┐  parallel
+  └─ memcpy ddr_buf[cur] → ION slot      ─┘
+  ┌─ TPU compute layer N                 ─┐  serial after DDR→ION
+  └─ swap cur ↔ next                     ─┘
+
+LM Head (48 vocab chunks of 1024 tokens):
+  ┌─ Pre-read chunk i+1 from ION embed / SD  ─┐
+  └─ CMD_MHA_EMBED_XPOSE (sec-core transpose) ─┘ parallel
+  ┌─ TPU matmul(dst_buf[cur])                ─┐
+  └─ Dequantize logits                       ─┘
+```
+
+### Secondary-core commands
+
+| Cmd ID | Name | Status | Description |
+|--------|------|--------|-------------|
+| 0x20 | MEMCPY | working | Memory copy in shared space |
+| 0x21 | MEMSET | working | Memory set |
+| 0x22 | CACHE_FLUSH | working | Cache flush |
+| 0x23 | CACHE_INVLD | working | Cache invalidate |
+| 0x24 | QUANTIZE | working | FP32→INT8 quantization |
+| 0x25 | TRANSPOSE | working | Matrix transpose |
+| 0x26 | DEQUANTIZE | working | INT8→FP32 dequantization |
+| **0x27** | **DDR_TO_ION** | **disabled** | DDR→ION async memcpy (needs DDR phys addr — pagemap unavailable) |
+| **0x28** | **EMBED_XPOSE** | **working** | Embedding chunk transpose (uses ION phys addr) |
+
+## Build
+
+### Prerequisites
+
+- Cross-compiler: `riscv64-unknown-linux-musl-gcc` (from [duo-examples](https://github.com/milkv-duo/duo-examples))
+- TPU SDK: `cvitek-tdl-sdk-cv180x` (from [duo-buildroot-sdk](https://github.com/milkv-duo/duo-buildroot-sdk))
+
+### Compile
+
+```bash
+cd tpu_bench
+# Edit Makefile: set SDK_ROOT and CROSS_COMPILE paths
+make smollm2_pool_demo       # Main inference binary
+make smollm2_demo            # Legacy single-core binary
+make                         # All benchmarks
+```
+
+### Rebuild FreeRTOS firmware (if modifying secondary-core commands)
+
+```bash
+cd duo-buildroot-sdk/freertos/cvitek
+export PATH="/path/to/riscv64-elf-x86_64/bin:$PATH"
+export MV_BOARD="milkv-duo-sd"
+export BUILD_PATH="/path/to/duo-buildroot-sdk/build"
+export BUILD_ENV_PATH="$BUILD_PATH"
+export DDR_64MB_SIZE="y"
+./build_cv180x.sh
+
+# Assemble fip.bin
+cd duo-buildroot-sdk/fsbl
+python3 plat/cv180x/fiptool.py -v genfip \
+    build/cv1800b_milkv_duo_sd/fip.bin \
+    --MONITOR_RUNADDR="0x80000000" \
+    --BLCP_2ND_RUNADDR="0x83f40000" \
+    --BLCP_2ND="/path/to/cvirtos.bin" \
+    ... (see fip_v2.mk for full args)
+
+# Flash to Duo
+cat fip.bin | ssh root@192.168.42.1 "cat > /boot/fip.bin && sync && reboot"
+```
+
+## Convert & Deploy Weights
+
+### Convert SmolLM2-135M weights
+
+```bash
+pip install safetensors numpy
+python3 convert_smollm2.py \
+    --model "HuggingFaceTB/SmolLM2-135M-Instruct" \
+    --out ./smollm2_weights
+```
+
+This produces per-layer combined `layerN.bin` files and `embed.i8`.
+
+### Merge individual weight files into combined layers (on Duo)
+
+```bash
+# Compile merge tool
+riscv64-unknown-linux-musl-gcc -O3 -s -o merge_layers merge_layers.c
+# Deploy and run on Duo
+cat merge_layers | ssh root@192.168.42.1 "cat > /tmp/merge_layers && chmod +x /tmp/merge_layers"
+ssh root@192.168.42.1 "/tmp/merge_layers /root/smollm2 /root/smollm2_pool"
+```
+
+### Deploy binary & weights
+
+```bash
+# Push binary
+cat smollm2_pool_demo | ssh root@192.168.42.1 "cat > /root/smollm2_pool_demo && chmod +x /root/smollm2_pool_demo"
+
+# Push weights (if not already on SD card)
+scp -r smollm2_weights root@192.168.42.1:/root/smollm2_pool/
+```
+
+## Run Inference
+
+```bash
+# On Duo (via SSH)
+ssh root@192.168.42.1
+
+# Format: smollm2_pool_demo <weight_dir> <token_ids.bin> <max_new_tokens>
+/root/smollm2_pool_demo /root/smollm2_pool /root/test_tokens.bin 20
+```
+
+### Create test tokens
+
+```python
+from smollm2_tokenize import tokenize
+token_ids = tokenize("Hello, how are you?")
+# Write as int32 binary
+import struct
+with open("test_tokens.bin", "wb") as f:
+    for t in token_ids:
+        f.write(struct.pack("<i", t))
+```
+
+## Performance (CV1800B, Jul 2026)
+
+| Metric | Time | Notes |
+|--------|------|-------|
+| Prefill (6 tokens) | ~11,500 ms | Batch M=3 matmul |
+| Decode per token | ~11,950 ms | 30 layers × SD read + TPU |
+| LM Head (48 chunks) | ~4,600 ms | 33/48 chunks from ION cache |
+| Weight load per layer | ~170 ms | 3.38 MB SD→DDR→ION |
+
+### Bottlenecks
+
+1. **SD card bandwidth** (~2-3 MB/s): every layer (3.38 MB) re-read from SD each decode step.  30 layers × 200 ms ≈ 6 s.
+2. **LM Head**: ~15 embed chunks still require SD reads (embed is 28 MB, ION is 24 MB).
+3. **DDR→ION secondary core offload disabled**: `/proc/self/pagemap` unavailable → DDR physical addresses cannot be resolved → `CMD_MHA_DDR_TO_ION` never invoked.
+4. **ION slot count**: Only 2 layer slots fit after preserving embed cache (17.6 MB + 2 × 3.38 MB ≈ 24 MB).
+
+### Optimization roadmap
+
+- [ ] Resolve DDR physical addresses (kernel patch for `CONFIG_PROC_PAGE_MONITOR` or `mmap` ION)
+- [ ] Pre-load embed SD-range chunks into DDR staging during the layer loop (hide SD latency)
+- [ ] Investigate SDIO access from secondary core (C906L)
+- [ ] Investigate TPU matmul tiling for larger M in prefill
+
+## License
+
+MIT

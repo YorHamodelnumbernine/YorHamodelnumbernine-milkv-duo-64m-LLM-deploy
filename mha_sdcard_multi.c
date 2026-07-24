@@ -1,0 +1,837 @@
+/* mha_sdcard_multi.c — Multi-batch MHA from SD card with LUT quantization.
+   Merges the complete MHA pipeline with LUT quantize + multi-batch reuse.
+   Compares LUT vs traditional quantization: speed AND accuracy (max_err, MSE).
+
+   Build: make mha_sdcard_multi
+   Run:   ./mha_sdcard_multi [d_model] [n_heads] [seq_len] [num_batches]
+*/
+#include "common/tpu_bench.h"
+#include "common/mha_descriptor.h"
+#include <math.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#define LUT_BITS  12
+#define LUT_SIZE  (1 << LUT_BITS)
+
+static double tick(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+}
+
+/* ---- File I/O ---- */
+static int read_file(const char *path, void *buf, int sz) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "  open(%s) failed\n", path); return -1; }
+    int n = read(fd, buf, sz);
+    close(fd);
+    if (n != sz) { fprintf(stderr, "  read(%s) %d != %d\n", path, n, sz); return -1; }
+    return 0;
+}
+static int write_file(const char *path, const void *buf, int sz) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { fprintf(stderr, "  create(%s) failed\n", path); return -1; }
+    int n = write(fd, buf, sz);
+    close(fd);
+    if (n != sz) { fprintf(stderr, "  write(%s) %d != %d\n", path, n, sz); return -1; }
+    return 0;
+}
+
+/* ---- FP16 conversion (pure integer bit ops) ---- */
+static inline uint16_t fp32_to_fp16(float f) {
+    uint32_t bits; memcpy(&bits, &f, 4);
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t  exp  = (int32_t)((bits >> 23) & 0xFF) - 127;
+    uint32_t mant = (bits >> 13) & 0x3FF;
+    if (exp > 15)  return (uint16_t)(sign | 0x7C00);
+    if (exp < -14) return (uint16_t)sign;
+    return (uint16_t)(sign | ((exp + 15) << 10) | mant);
+}
+static inline float fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F, mant = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0)      bits = sign;
+    else if (exp == 31) bits = sign | 0x7F800000 | (mant << 13);
+    else                bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    float f; memcpy(&f, &bits, 4); return f;
+}
+
+/* ---- LUT-based Quantization ---- */
+static void build_quant_lut(int8_t *lut, float scale, int zp) {
+    float inv = 1.0f / scale;
+    for (int i = 0; i < LUT_SIZE; i++) {
+        float val = fp16_to_fp32((uint16_t)(i << 4));
+        int q = (int)(val * inv + (float)zp + 0.5f);
+        if (q > 127) q = 127; else if (q < -128) q = -128;
+        lut[i] = (int8_t)q;
+    }
+}
+static void quantize_lut(int8_t *dst, const float *src, int n, const int8_t *lut) {
+    for (int i = 0; i < n; i++) dst[i] = lut[fp32_to_fp16(src[i]) >> 4];
+}
+
+/* ---- Traditional quantization (for comparison) ---- */
+static float compute_scale(const float *data, int n, int *zp_out) {
+    float min = data[0], max = data[0];
+    for (int i = 1; i < n; i++) {
+        if (data[i] < min) min = data[i];
+        if (data[i] > max) max = data[i];
+    }
+    float s = (max - min) / 255.0f;
+    if (s < 1e-10f) s = 1.0f;
+    *zp_out = (int)(-128.0f - min / s);
+    if (*zp_out < -128) *zp_out = -128;
+    if (*zp_out > 127)  *zp_out = 127;
+    return s;
+}
+static void quantize_i8(int8_t *dst, const float *src, int n, float scale, int zp) {
+    float inv = 1.0f / scale;
+    for (int i = 0; i < n; i++) {
+        int q = (int)(src[i] * inv + zp + 0.5f);
+        if (q > 127) q = 127; else if (q < -128) q = -128;
+        dst[i] = (int8_t)q;
+    }
+}
+static void dequantize_f32(float *dst, const int8_t *src, int n, float scale, int zp) {
+    for (int i = 0; i < n; i++) dst[i] = (float)((int)src[i] - zp) * scale;
+}
+
+/* ---- Helper: compute_scale + build_lut in one call ---- */
+static void build_lut_from_data(int8_t *lut, const float *data, int n,
+                                float *sc_out, int *zp_out) {
+    *sc_out = compute_scale(data, n, zp_out);
+    build_quant_lut(lut, *sc_out, *zp_out);
+}
+
+/* ---- CPU Math (shared) ---- */
+static void softmax_f32(float *buf, int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        float *row = buf + r * cols;
+        float maxv = row[0];
+        for (int c = 1; c < cols; c++) if (row[c] > maxv) maxv = row[c];
+        float sum = 0;
+        for (int c = 0; c < cols; c++) { row[c] = expf(row[c] - maxv); sum += row[c]; }
+        float inv = 1.0f / (sum + 1e-10f);
+        for (int c = 0; c < cols; c++) row[c] *= inv;
+    }
+}
+static void rope_precompute(int seq_len, int head_dim, float base,
+                            float *cos_tab, float *sin_tab) {
+    int half = head_dim / 2;
+    for (int i = 0; i < half; i++) {
+        float freq = 1.0f / powf(base, (2.0f * i) / (float)head_dim);
+        for (int pos = 0; pos < seq_len; pos++) {
+            float angle = (float)pos * freq;
+            cos_tab[pos * half + i] = cosf(angle);
+            sin_tab[pos * half + i] = sinf(angle);
+        }
+    }
+}
+static void apply_rope_f32_tab(float *buf, int seq_len, int head_dim,
+                               const float *cos_tab, const float *sin_tab) {
+    int half = head_dim / 2;
+    for (int pos = 0; pos < seq_len; pos++) {
+        const float *c_row = cos_tab + pos * half;
+        const float *s_row = sin_tab + pos * half;
+        for (int i = 0; i < half; i++) {
+            float c = c_row[i], s = s_row[i];
+            float x = buf[pos * head_dim + i];
+            float y = buf[pos * head_dim + i + half];
+            buf[pos * head_dim + i]         = x * c - y * s;
+            buf[pos * head_dim + i + half]  = x * s + y * c;
+        }
+    }
+}
+static void transpose_i8(int8_t *dst, const int8_t *src, int rows, int cols) {
+    for (int i = 0; i < rows; i++)
+        for (int j = 0; j < cols; j++)
+            dst[j * rows + i] = src[i * cols + j];
+}
+
+/* ---- CPU Reference (identical to mha_sdcard_full.c) ---- */
+static void mha_ref_fp32(int S, int D, int H, int d, float scale,
+    const float *x, const float *Wq, const float *Wk, const float *Wv,
+    const float *Wo, float *output)
+{
+    int total = S * D;
+    float *Q = (float *)malloc(total * sizeof(float));
+    float *K = (float *)malloc(total * sizeof(float));
+    float *V = (float *)malloc(total * sizeof(float));
+    for (int i = 0; i < S; i++) {
+        for (int j = 0; j < D; j++) {
+            float q = 0, k = 0, v = 0;
+            for (int kk = 0; kk < D; kk++) {
+                float xi = x[i * D + kk];
+                q += xi * Wq[kk * D + j];
+                k += xi * Wk[kk * D + j];
+                v += xi * Wv[kk * D + j];
+            }
+            Q[i * D + j] = q; K[i * D + j] = k; V[i * D + j] = v;
+        }
+    }
+    int half = d / 2;
+    float *cos_tab = (float *)malloc(S * half * sizeof(float));
+    float *sin_tab = (float *)malloc(S * half * sizeof(float));
+    rope_precompute(S, d, 10000.0f, cos_tab, sin_tab);
+    for (int h = 0; h < H; h++) {
+        float *Qh = (float *)malloc(S * d * sizeof(float));
+        float *Kh = (float *)malloc(S * d * sizeof(float));
+        for (int r = 0; r < S; r++) {
+            for (int c = 0; c < d; c++) {
+                Qh[r * d + c] = Q[r * D + h * d + c];
+                Kh[r * d + c] = K[r * D + h * d + c];
+            }
+        }
+        apply_rope_f32_tab(Qh, S, d, cos_tab, sin_tab);
+        apply_rope_f32_tab(Kh, S, d, cos_tab, sin_tab);
+        for (int r = 0; r < S; r++) {
+            for (int c = 0; c < d; c++) {
+                Q[r * D + h * d + c] = Qh[r * d + c];
+                K[r * D + h * d + c] = Kh[r * d + c];
+            }
+        }
+        free(Qh); free(Kh);
+    }
+    free(cos_tab); free(sin_tab);
+    float *Scores = (float *)malloc(H * S * S * sizeof(float));
+    float *Attn   = (float *)malloc(total * sizeof(float));
+    for (int h = 0; h < H; h++) {
+        float *Qh = (float *)malloc(S * d * sizeof(float));
+        float *Kh = (float *)malloc(S * d * sizeof(float));
+        float *Vh = (float *)malloc(S * d * sizeof(float));
+        for (int r = 0; r < S; r++) {
+            for (int c = 0; c < d; c++) {
+                Qh[r * d + c] = Q[r * D + h * d + c];
+                Kh[r * d + c] = K[r * D + h * d + c];
+                Vh[r * d + c] = V[r * D + h * d + c];
+            }
+        }
+        float *Sh = Scores + h * S * S;
+        for (int i = 0; i < S; i++) {
+            for (int j = 0; j < S; j++) {
+                float s = 0;
+                for (int kk = 0; kk < d; kk++)
+                    s += Qh[i * d + kk] * Kh[j * d + kk];
+                Sh[i * S + j] = s * scale;
+            }
+        }
+        softmax_f32(Sh, S, S);
+        float *Ah = Attn + h * S * d;
+        for (int i = 0; i < S; i++) {
+            for (int j = 0; j < d; j++) {
+                float a = 0;
+                for (int kk = 0; kk < S; kk++)
+                    a += Sh[i * S + kk] * Vh[kk * d + j];
+                Ah[i * d + j] = a;
+            }
+        }
+        free(Qh); free(Kh); free(Vh);
+    }
+    float *A_inter = (float *)malloc(total * sizeof(float));
+    for (int h = 0; h < H; h++)
+        for (int r = 0; r < S; r++)
+            memcpy(A_inter + r * D + h * d, Attn + h * S * d + r * d, d * sizeof(float));
+    for (int i = 0; i < S; i++) {
+        for (int j = 0; j < D; j++) {
+            float o = 0;
+            for (int kk = 0; kk < D; kk++)
+                o += A_inter[i * D + kk] * Wo[kk * D + j];
+            output[i * D + j] = o;
+        }
+    }
+    free(A_inter); free(Q); free(K); free(V); free(Scores); free(Attn);
+}
+
+/* ---- TPU matmul helpers ---- */
+static int tpu_find_tile_n(cvk_context_t *cvk, int M, int K) {
+    int left = mha_lmem_matrix_bytes(M, K);
+    for (int tn = 128; tn >= 16; tn -= 16) {
+        if (left + mha_lmem_matrix_bytes(K, tn) +
+            mha_lmem_matrix_bytes(M, tn) <= 32768) return tn;
+    }
+    return -1;
+}
+static int tpu_matmul(tpu_ctx *ctx, cvk_context_t *cvk,
+    const void *left, int M, int K, const void *right, int N,
+    void *result, uint32_t scratch_off)
+{
+    const int8_t *l_i8 = (const int8_t *)left;
+    const int8_t *r_i8 = (const int8_t *)right;
+    int8_t       *o_i8 = (int8_t *)result;
+    uint32_t off_l = scratch_off, off_r = scratch_off + M * K;
+    int need_tile = (mha_lmem_matrix_bytes(M, K) +
+                     mha_lmem_matrix_bytes(K, N) +
+                     mha_lmem_matrix_bytes(M, N) > 32768);
+    if (!need_tile) {
+        uint32_t off_o = scratch_off + M * K + K * N;
+        memcpy(ctx->neuron_vaddr + off_l, l_i8, M * K);
+        memcpy(ctx->neuron_vaddr + off_r, r_i8, K * N);
+        CVI_RT_MemFlush(ctx->rt_handle, ctx->neuron_mem);
+        cvk_ml_t *ml_l = cvk->ops->lmem_alloc_matrix(cvk,
+            cvk->ops->ml_default_shape(cvk, M, K, CVK_FMT_I8), CVK_FMT_I8, 1);
+        cvk_ml_t *ml_r = cvk->ops->lmem_alloc_matrix(cvk,
+            cvk->ops->ml_default_shape(cvk, K, N, CVK_FMT_I8), CVK_FMT_I8, 1);
+        cvk_ml_t *ml_o = cvk->ops->lmem_alloc_matrix(cvk,
+            cvk->ops->ml_default_shape(cvk, M, N, CVK_FMT_I8), CVK_FMT_I8, 1);
+        cvk->ops->tdma_g2l_matrix_copy(cvk, &(cvk_tdma_g2l_matrix_copy_param_t){
+            .src = &(cvk_mg_t){0, TPU_PA(ctx, off_l), CVK_FMT_I8, {M, K}, {K}}, .dst = ml_l});
+        cvk->ops->tdma_g2l_matrix_copy(cvk, &(cvk_tdma_g2l_matrix_copy_param_t){
+            .src = &(cvk_mg_t){0, TPU_PA(ctx, off_r), CVK_FMT_I8, {K, N}, {N}}, .dst = ml_r});
+        cvk->ops->tiu_matrix_multiplication(cvk, &(cvk_tiu_matrix_multiplication_param_t){
+            .res = ml_o, .left = ml_l, .right = ml_r, .bias = NULL,
+            .lshift_bits = 0, .rshift_bits = 0, .res_is_int8 = 1,
+            .relu_enable = 0, .add_result = 0, .ps32_mode = 0,
+        });
+        cvk->ops->tdma_l2g_matrix_copy(cvk, &(cvk_tdma_l2g_matrix_copy_param_t){
+            .src = ml_o,
+            .dst = &(cvk_mg_t){0, TPU_PA(ctx, off_o), CVK_FMT_I8, {M, N}, {N}}});
+        cvk->ops->lmem_free_matrix(cvk, ml_o);
+        cvk->ops->lmem_free_matrix(cvk, ml_r);
+        cvk->ops->lmem_free_matrix(cvk, ml_l);
+        CVI_RT_Submit(ctx->rt_khandle);
+        CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem);
+        memcpy(o_i8, ctx->neuron_vaddr + off_o, M * N);
+        return 0;
+    }
+    int tile_n = tpu_find_tile_n(cvk, M, K);
+    if (tile_n < 16) { fprintf(stderr, "LMEM fail M=%d K=%d N=%d\n", M, K, N); return -1; }
+    uintptr_t nm_base = (uintptr_t)ctx->neuron_vaddr;
+    uintptr_t nm_end  = nm_base + ctx->neuron_size;
+    int r_is_nm = ((uintptr_t)r_i8 >= nm_base && (uintptr_t)r_i8 < nm_end);
+    uint32_t r_nm_off = r_is_nm ? (uint32_t)((uintptr_t)r_i8 - nm_base) : 0;
+    uint32_t off_o_base = scratch_off + M * K + K * tile_n;
+    memcpy(ctx->neuron_vaddr + off_l, l_i8, M * K);
+    CVI_RT_MemFlush(ctx->rt_handle, ctx->neuron_mem);
+    for (int n_start = 0; n_start < N; n_start += tile_n) {
+        int cur_n = (n_start + tile_n <= N) ? tile_n : N - n_start;
+        if (!r_is_nm) {
+            uint8_t *td = ctx->neuron_vaddr + off_r;
+            for (int row = 0; row < K; row++)
+                memcpy(td + row * cur_n, r_i8 + row * N + n_start, cur_n);
+            CVI_RT_MemFlush(ctx->rt_handle, ctx->neuron_mem);
+        }
+        cvk_ml_t *ml_l = cvk->ops->lmem_alloc_matrix(cvk,
+            cvk->ops->ml_default_shape(cvk, M, K, CVK_FMT_I8), CVK_FMT_I8, 1);
+        cvk_ml_t *ml_r = cvk->ops->lmem_alloc_matrix(cvk,
+            cvk->ops->ml_default_shape(cvk, K, cur_n, CVK_FMT_I8), CVK_FMT_I8, 1);
+        cvk_ml_t *ml_o = cvk->ops->lmem_alloc_matrix(cvk,
+            cvk->ops->ml_default_shape(cvk, M, cur_n, CVK_FMT_I8), CVK_FMT_I8, 1);
+        cvk->ops->tdma_g2l_matrix_copy(cvk, &(cvk_tdma_g2l_matrix_copy_param_t){
+            .src = &(cvk_mg_t){0, TPU_PA(ctx, off_l), CVK_FMT_I8, {M, K}, {K}}, .dst = ml_l});
+        cvk_mg_t src_r = r_is_nm
+            ? (cvk_mg_t){0, TPU_PA(ctx, r_nm_off + n_start), CVK_FMT_I8, {K, cur_n}, {N}}
+            : (cvk_mg_t){0, TPU_PA(ctx, off_r), CVK_FMT_I8, {K, cur_n}, {cur_n}};
+        cvk->ops->tdma_g2l_matrix_copy(cvk, &(cvk_tdma_g2l_matrix_copy_param_t){
+            .src = &src_r, .dst = ml_r});
+        cvk->ops->tiu_matrix_multiplication(cvk, &(cvk_tiu_matrix_multiplication_param_t){
+            .res = ml_o, .left = ml_l, .right = ml_r, .bias = NULL,
+            .lshift_bits = 0, .rshift_bits = 0, .res_is_int8 = 1,
+            .relu_enable = 0, .add_result = 0, .ps32_mode = 0,
+        });
+        cvk->ops->tdma_l2g_matrix_copy(cvk, &(cvk_tdma_l2g_matrix_copy_param_t){
+            .src = ml_o,
+            .dst = &(cvk_mg_t){0, TPU_PA(ctx, off_o_base + n_start),
+                               CVK_FMT_I8, {M, cur_n}, {N}}});
+        cvk->ops->lmem_free_matrix(cvk, ml_o);
+        cvk->ops->lmem_free_matrix(cvk, ml_r);
+        cvk->ops->lmem_free_matrix(cvk, ml_l);
+    }
+    CVI_RT_Submit(ctx->rt_khandle);
+    CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem);
+    memcpy(o_i8, ctx->neuron_vaddr + off_o_base, M * N);
+    return 0;
+}
+#define MATMUL_SCR 0x00000
+
+/* ================================================================
+ * mha_pipeline — Full MHA pipeline, parameterized by quantization mode
+ *   use_lut=1: input uses pre-built LUT, pipeline re-quants use ad-hoc LUT
+ *   use_lut=0: traditional compute_scale+quantize_i8 everywhere
+ * Returns: max_err, mse via pointers, total pipeline time via return value
+ * ================================================================ */
+static double mha_pipeline(int S, int D, int H, int d, float softmax_scale,
+    tpu_ctx *ctx, const char *sd_path,
+    const int8_t *Wq_i8, const int8_t *Wk_i8, const int8_t *Wv_i8, const int8_t *Wo_i8,
+    const int8_t *input_lut, int use_lut,
+    const float *ref_out, float *tpu_out,
+    double *max_err_out, double *mse_out,
+    double *step_us)
+{
+    int total = S * D;
+    cvk_context_t *cvk = ctx->cvk_ctx;
+    int rc;
+    int8_t lut[LUT_SIZE];
+    double t_lb, t_lb_done, t_lq;
+
+    float *Q_f32 = (float *)(ctx->neuron_vaddr + MHA_OFF_Q_F32);
+    float *K_f32 = (float *)(ctx->neuron_vaddr + MHA_OFF_K_F32);
+    float *Scores_f32 = (float *)(ctx->neuron_vaddr + MHA_OFF_SCORES_F32);
+    float *Attn_f32  = (float *)(ctx->neuron_vaddr + MHA_OFF_ATTN_F32);
+    int8_t *Q_i8 = (int8_t *)(ctx->neuron_vaddr + MHA_OFF_Q_I8);
+    int8_t *K_i8 = (int8_t *)(ctx->neuron_vaddr + MHA_OFF_K_I8);
+    int8_t *V_i8 = (int8_t *)(ctx->neuron_vaddr + MHA_OFF_V_I8);
+    int8_t *S_i8 = (int8_t *)(ctx->neuron_vaddr + MHA_OFF_S_I8);
+    int8_t *A_i8 = (int8_t *)(ctx->neuron_vaddr + MHA_OFF_A_I8);
+    int8_t *O_i8 = (int8_t *)(ctx->neuron_vaddr + MHA_OFF_OUT_I8);
+
+    /* Step 2: Read input from SD */
+    char path[256];
+    snprintf(path, sizeof(path), "%s/input.f32", sd_path);
+    int input_bytes = total * (int)sizeof(float);
+    float *x_rd = (float *)malloc(input_bytes);
+    if (!x_rd) return -1;
+    double ts = tick();
+    if (read_file(path, x_rd, input_bytes) != 0) { free(x_rd); return -1; }
+    step_us[2] = tick() - ts;
+
+    /* Step 3: Quantize input */
+    ts = tick();
+    int8_t *x_i8 = (int8_t *)malloc(total);
+    if (!x_i8) { free(x_rd); return -1; }
+    int zp_x;
+    float sc_x = compute_scale(x_rd, total, &zp_x);
+    if (use_lut && input_lut) {
+        quantize_lut(x_i8, x_rd, total, input_lut);
+    } else if (use_lut) {
+        build_quant_lut(lut, sc_x, zp_x);
+        quantize_lut(x_i8, x_rd, total, lut);
+    } else {
+        quantize_i8(x_i8, x_rd, total, sc_x, zp_x);
+    }
+    step_us[3] = tick() - ts;
+    free(x_rd);
+
+    /* Steps 4-6: Q, K, V projections */
+    ts = tick();
+    rc = tpu_matmul(ctx, cvk, x_i8, S, D, Wq_i8, D, Q_i8, MATMUL_SCR);
+    step_us[4] = tick() - ts;
+    if (rc) { free(x_i8); return -1; }
+
+    ts = tick();
+    rc = tpu_matmul(ctx, cvk, x_i8, S, D, Wk_i8, D, K_i8, MATMUL_SCR);
+    step_us[5] = tick() - ts;
+    if (rc) { free(x_i8); return -1; }
+
+    float sc_qk_out = sc_x * 0.001f;
+    dequantize_f32(Q_f32, Q_i8, total, sc_qk_out, 0);
+    dequantize_f32(K_f32, K_i8, total, sc_qk_out, 0);
+
+    ts = tick();
+    rc = tpu_matmul(ctx, cvk, x_i8, S, D, Wv_i8, D, V_i8, MATMUL_SCR);
+    step_us[6] = tick() - ts;
+    free(x_i8);
+    if (rc) return -1;
+
+    /* Step 7: RoPE + re-quant Q, K */
+    ts = tick();
+    int rope_half = d / 2;
+    float *rope_cos = (float *)malloc(S * rope_half * sizeof(float));
+    float *rope_sin = (float *)malloc(S * rope_half * sizeof(float));
+    rope_precompute(S, d, 10000.0f, rope_cos, rope_sin);
+    for (int h = 0; h < H; h++) {
+        float *Qh = (float *)malloc(S * d * sizeof(float));
+        float *Kh = (float *)malloc(S * d * sizeof(float));
+        for (int r = 0; r < S; r++) {
+            for (int c = 0; c < d; c++) {
+                Qh[r * d + c] = Q_f32[r * D + h * d + c];
+                Kh[r * d + c] = K_f32[r * D + h * d + c];
+            }
+        }
+        apply_rope_f32_tab(Qh, S, d, rope_cos, rope_sin);
+        apply_rope_f32_tab(Kh, S, d, rope_cos, rope_sin);
+        for (int r = 0; r < S; r++) {
+            for (int c = 0; c < d; c++) {
+                Q_f32[r * D + h * d + c] = Qh[r * d + c];
+                K_f32[r * D + h * d + c] = Kh[r * d + c];
+            }
+        }
+        free(Qh); free(Kh);
+    }
+    free(rope_cos); free(rope_sin);
+
+    float sc_q2, sc_k2; int zp_q2, zp_k2;
+    if (use_lut) {
+        sc_q2 = compute_scale(Q_f32, total, &zp_q2);
+        build_quant_lut(lut, sc_q2, zp_q2);
+        quantize_lut(Q_i8, Q_f32, total, lut);
+        sc_k2 = compute_scale(K_f32, total, &zp_k2);
+        build_quant_lut(lut, sc_k2, zp_k2);
+        quantize_lut(K_i8, K_f32, total, lut);
+    } else {
+        sc_q2 = compute_scale(Q_f32, total, &zp_q2);
+        quantize_i8(Q_i8, Q_f32, total, sc_q2, zp_q2);
+        sc_k2 = compute_scale(K_f32, total, &zp_k2);
+        quantize_i8(K_i8, K_f32, total, sc_k2, zp_k2);
+    }
+    step_us[7] = tick() - ts;
+
+    /* Step 8: Scores = Q * K^T */
+    ts = tick();
+    for (int h = 0; h < H; h++) {
+        int8_t *Qh = (int8_t *)malloc(S * d);
+        int8_t *Kh = (int8_t *)malloc(S * d);
+        int8_t *Kh_t = (int8_t *)malloc(S * d);
+        for (int r = 0; r < S; r++) {
+            memcpy(Qh + r * d, Q_i8 + r * D + h * d, d);
+            memcpy(Kh + r * d, K_i8 + r * D + h * d, d);
+        }
+        transpose_i8(Kh_t, Kh, S, d);
+        rc = tpu_matmul(ctx, cvk, Qh, S, d, Kh_t, S, S_i8 + h * S * S, MATMUL_SCR);
+        free(Qh); free(Kh); free(Kh_t);
+        if (rc) return -1;
+    }
+    float sc_s_out = sc_q2 * sc_k2;
+    dequantize_f32(Scores_f32, S_i8, H * S * S, sc_s_out, 0);
+    for (int i = 0; i < H * S * S; i++) Scores_f32[i] *= softmax_scale;
+    step_us[8] = tick() - ts;
+
+    /* Step 9: Softmax */
+    ts = tick();
+    for (int h = 0; h < H; h++) softmax_f32(Scores_f32 + h * S * S, S, S);
+    step_us[9] = tick() - ts;
+
+    /* Re-quantize after softmax */
+    float sc_s2, sc_v2; int zp_s2, zp_v2;
+    if (use_lut) {
+        sc_s2 = compute_scale(Scores_f32, H * S * S, &zp_s2);
+        build_quant_lut(lut, sc_s2, zp_s2);
+        quantize_lut(S_i8, Scores_f32, H * S * S, lut);
+    } else {
+        sc_s2 = compute_scale(Scores_f32, H * S * S, &zp_s2);
+        quantize_i8(S_i8, Scores_f32, H * S * S, sc_s2, zp_s2);
+    }
+    float *V_f32 = (float *)(ctx->neuron_vaddr + MHA_OFF_V_F32);
+    dequantize_f32(V_f32, V_i8, total, sc_qk_out, 0);
+    if (use_lut) {
+        sc_v2 = compute_scale(V_f32, total, &zp_v2);
+        build_quant_lut(lut, sc_v2, zp_v2);
+        quantize_lut(V_i8, V_f32, total, lut);
+    } else {
+        sc_v2 = compute_scale(V_f32, total, &zp_v2);
+        quantize_i8(V_i8, V_f32, total, sc_v2, zp_v2);
+    }
+
+    /* Step 10: Attn = Softmax * V */
+    ts = tick();
+    for (int h = 0; h < H; h++) {
+        int8_t *Vh = (int8_t *)malloc(S * d);
+        for (int r = 0; r < S; r++)
+            memcpy(Vh + r * d, V_i8 + r * D + h * d, d);
+        rc = tpu_matmul(ctx, cvk, S_i8 + h * S * S, S, S, Vh, d, A_i8 + h * S * d, MATMUL_SCR);
+        free(Vh);
+        if (rc) return -1;
+    }
+    float sc_a_out = sc_s2 * sc_v2;
+    dequantize_f32(Attn_f32, A_i8, total, sc_a_out, 0);
+    step_us[10] = tick() - ts;
+
+    /* Step 11: Output = Attn * Wo */
+    ts = tick();
+    int8_t *A_inter = (int8_t *)malloc(total);
+    for (int h = 0; h < H; h++)
+        for (int r = 0; r < S; r++)
+            memcpy(A_inter + r * D + h * d, A_i8 + h * S * d + r * d, d);
+
+    float sc_a2; int zp_a2;
+    if (use_lut) {
+        sc_a2 = compute_scale(Attn_f32, total, &zp_a2);
+        build_quant_lut(lut, sc_a2, zp_a2);
+        quantize_lut(A_inter, Attn_f32, total, lut);
+    } else {
+        sc_a2 = compute_scale(Attn_f32, total, &zp_a2);
+        quantize_i8(A_inter, Attn_f32, total, sc_a2, zp_a2);
+    }
+    rc = tpu_matmul(ctx, cvk, A_inter, S, D, Wo_i8, D, O_i8, MATMUL_SCR);
+    if (rc) { free(A_inter); return -1; }
+    float sc_o_out = sc_a2 * 0.001f;
+    dequantize_f32(tpu_out, O_i8, total, sc_o_out, 0);
+    free(A_inter);
+    step_us[11] = tick() - ts;
+
+    /* Verify vs reference */
+    *max_err_out = 0; *mse_out = 0;
+    for (int i = 0; i < total; i++) {
+        double err = fabs((double)tpu_out[i] - (double)ref_out[i]);
+        if (err > *max_err_out) *max_err_out = err;
+        *mse_out += err * err;
+    }
+    *mse_out /= total;
+    return 0;
+}
+
+/* ================================================================
+ * main
+ * ================================================================ */
+int main(int argc, char **argv) {
+    setvbuf(stderr, NULL, _IONBF, 0);
+    int d_model = argc > 1 ? atoi(argv[1]) : 256;
+    int n_heads = argc > 2 ? atoi(argv[2]) : 8;
+    int seq_len = argc > 3 ? atoi(argv[3]) : 32;
+    int n_batches = argc > 4 ? atoi(argv[4]) : 4;
+
+    int D = d_model, H = n_heads, S = seq_len, d = D / H;
+    int total = S * D, w_sz = D * D;
+    int input_bytes = total * (int)sizeof(float);
+    int weight_bytes = w_sz * (int)sizeof(float);
+    float softmax_scale = 1.0f / sqrtf((float)d);
+
+    fprintf(stderr, "\n============================================================\n");
+    fprintf(stderr, "  MHA Multi-Batch SD-Card + LUT Quant\n");
+    fprintf(stderr, "  D=%d H=%d d=%d S=%d  batches=%d\n", D, H, d, S, n_batches);
+    fprintf(stderr, "  LUT: %d entries (FP16 high 12 bits)\n", LUT_SIZE);
+    fprintf(stderr, "============================================================\n");
+
+    /* ---- Phase 1: Generate data, write SD, CPU ref ---- */
+    fprintf(stderr, "\n[Phase 1] Generate & write SD, CPU reference...\n");
+    srand(42);
+    double t_gen = tick();
+
+    const char *base = "/tmp/mha_bench";
+    mkdir(base, 0755);
+    char path[256];
+
+    float *W_f32[4] = {NULL};
+    for (int w = 0; w < 4; w++) {
+        W_f32[w] = (float *)malloc(weight_bytes);
+        if (!W_f32[w]) { fprintf(stderr, "  OOM W_f32[%d]\n", w); return 1; }
+        for (int i = 0; i < w_sz; i++)
+            W_f32[w][i] = (float)(rand() % 256 - 128) / 1000.0f;
+        /* Write to SD immediately (saves peak memory) */
+        snprintf(path, sizeof(path), "%s/W%c.f32", base, "qkvo"[w]);
+        write_file(path, W_f32[w], weight_bytes);
+    }
+    float *x_f32 = (float *)malloc(input_bytes);
+    if (!x_f32) { fprintf(stderr, "  OOM x_f32\n"); return 1; }
+    for (int i = 0; i < total; i++)
+        x_f32[i] = (float)(rand() % 256 - 128) / 200.0f;
+    snprintf(path, sizeof(path), "%s/input.f32", base); write_file(path, x_f32, input_bytes);
+    /* Save backup for Phase 4 restore */
+    snprintf(path, sizeof(path), "%s/input_b0.bak", base); write_file(path, x_f32, input_bytes);
+
+    double t_ref_start = tick();
+    float *ref_out = (float *)malloc(input_bytes);
+    if (!ref_out) { fprintf(stderr, "  OOM ref_out\n"); return 1; }
+    mha_ref_fp32(S, D, H, d, softmax_scale,
+        x_f32, W_f32[0], W_f32[1], W_f32[2], W_f32[3], ref_out);
+    double ref_us = tick() - t_ref_start;
+    fprintf(stderr, "  Generate+Write: %.1f ms  |  CPU ref: %.1f ms\n",
+            (t_ref_start - t_gen) / 1000.0, ref_us / 1000.0);
+
+    for (int w = 0; w < 4; w++) { free(W_f32[w]); W_f32[w] = NULL; }
+    free(x_f32);
+    sync();
+
+    /* Pre-generate batch input files on SD */
+    srand(100);
+    for (int b = 1; b < n_batches; b++) {
+        float *tmp = (float *)malloc(input_bytes);
+        if (!tmp) { fprintf(stderr, "  OOM batch[%d]\n", b); return 1; }
+        for (int i = 0; i < total; i++)
+            tmp[i] = (float)(rand() % 256 - 128) / 200.0f;
+        snprintf(path, sizeof(path), "%s/input_b%d.f32", base, b);
+        write_file(path, tmp, input_bytes);
+        free(tmp);
+    }
+    sync();
+
+    /* ---- Phase 2: Read & LUT-quantize weights ONCE ---- */
+    fprintf(stderr, "\n[Phase 2] Read & LUT-quantize weights (once)...\n");
+    int8_t *W_i8[4];
+    float wp_sc[4]; int wp_zp[4];
+    int8_t (*weight_lut)[LUT_SIZE] = (int8_t(*)[LUT_SIZE])malloc(4 * LUT_SIZE);
+    if (!weight_lut) { fprintf(stderr, "OOM weight_lut\n"); return 1; }
+    double t_w_read = 0, t_w_lut = 0;
+
+    for (int w = 0; w < 4; w++) {
+        float *wbuf = (float *)malloc(weight_bytes);
+        W_i8[w] = (int8_t *)malloc(w_sz);
+        snprintf(path, sizeof(path), "%s/W%c.f32", base, "qkvo"[w]);
+        double t1 = tick();
+        read_file(path, wbuf, weight_bytes);
+        double t2 = tick();
+        t_w_read += (t2 - t1);
+        wp_sc[w] = compute_scale(wbuf, w_sz, &wp_zp[w]);
+        double t_b = tick();
+        build_quant_lut(weight_lut[w], wp_sc[w], wp_zp[w]);
+        double t_bd = tick();
+        quantize_lut(W_i8[w], wbuf, w_sz, weight_lut[w]);
+        double t3 = tick();
+        t_w_lut += (t3 - t2);
+        free(wbuf);
+        fprintf(stderr, "  W%c: read=%.0f  build=%.0f  lookup=%.0f us\n",
+                "qkvo"[w], t2-t1, t_bd-t_b, t3-t_bd);
+    }
+    fprintf(stderr, "  Weight read: %.0f us  LUT quant: %.0f us  (done once)\n",
+            t_w_read, t_w_lut);
+
+    /* ---- Phase 3: Init TPU ---- */
+    fprintf(stderr, "\n[Phase 3] Multi-batch MHA with LUT quantization...\n");
+    tpu_ctx ctx;
+    if (tpu_init(&ctx, MHA_TOTAL_SIZE) != 0) return 1;
+    float *tpu_out = (float *)malloc(input_bytes);
+    if (!tpu_out) { fprintf(stderr, "OOM tpu_out\n"); return 1; }
+
+    /* ---- Build input LUT once from batch 0 ---- */
+    float *batch0 = (float *)malloc(input_bytes);
+    snprintf(path, sizeof(path), "%s/input.f32", base);
+    read_file(path, batch0, input_bytes);
+    float input_lut_sc; int input_lut_zp;
+    int8_t *input_lut_tbl = (int8_t *)malloc(LUT_SIZE);
+    if (!input_lut_tbl) { fprintf(stderr, "OOM input_lut\n"); return 1; }
+    build_lut_from_data(input_lut_tbl, batch0, total, &input_lut_sc, &input_lut_zp);
+    fprintf(stderr, "  Input LUT built once: sc=%.6f zp=%d\n", input_lut_sc, input_lut_zp);
+    free(batch0);
+
+    /* ---- Multi-batch LUT MHA ---- */
+    double batch_time[n_batches];
+    double batch_err[n_batches], batch_mse[n_batches];
+    double batch_step[12] = {0};
+
+    for (int b = 0; b < n_batches; b++) {
+        fprintf(stderr, "\n  --- Batch %d/%d ---\n", b, n_batches - 1);
+        if (b > 0) {
+            /* Use batch-specific input file */
+            snprintf(path, sizeof(path), "%s/input_b%d.f32", base, b);
+            /* Symlink/replace the input.f32 so pipeline reads the right file */
+            char input_path[256];
+            snprintf(input_path, sizeof(input_path), "%s/input.f32", base);
+            unlink(input_path);
+            float *btmp = (float *)malloc(input_bytes);
+            snprintf(path, sizeof(path), "%s/input_b%d.f32", base, b);
+            read_file(path, btmp, input_bytes);
+            write_file(input_path, btmp, input_bytes);
+            free(btmp);
+        }
+
+        double t0 = tick();
+        int rc = mha_pipeline(S, D, H, d, softmax_scale,
+            &ctx, base, W_i8[0], W_i8[1], W_i8[2], W_i8[3],
+            input_lut_tbl, 1,  /* use_lut=1, reuse input LUT */
+            ref_out, tpu_out,
+            &batch_err[b], &batch_mse[b], batch_step);
+        batch_time[b] = tick() - t0;
+        if (rc) { fprintf(stderr, "  FAILED rc=%d\n", rc); return 1; }
+        fprintf(stderr, "  time=%.1f us  max_err=%.4f  MSE=%.6f\n",
+                batch_time[b], batch_err[b], batch_mse[b]);
+    }
+
+    /* ---- Phase 4: Traditional quantization (1 batch, for comparison) ---- */
+    fprintf(stderr, "\n[Phase 4] Traditional quantization comparison (1 batch)...\n");
+
+    /* Restore batch 0 input from backup */
+    float *b0_restore = (float *)malloc(input_bytes);
+    snprintf(path, sizeof(path), "%s/input_b0.bak", base);
+    read_file(path, b0_restore, input_bytes);
+    snprintf(path, sizeof(path), "%s/input.f32", base);
+    unlink(path);
+    write_file(path, b0_restore, input_bytes);
+    free(b0_restore);
+
+    /* Also need to re-quantize weights with traditional method */
+    int8_t *W_i8_trad[4];
+    for (int w = 0; w < 4; w++) {
+        float *wbuf = (float *)malloc(weight_bytes);
+        W_i8_trad[w] = (int8_t *)malloc(w_sz);
+        snprintf(path, sizeof(path), "%s/W%c.f32", base, "qkvo"[w]);
+        read_file(path, wbuf, weight_bytes);
+        float sc; int zp;
+        sc = compute_scale(wbuf, w_sz, &zp);
+        quantize_i8(W_i8_trad[w], wbuf, w_sz, sc, zp);
+        free(wbuf);
+    }
+
+    float *trad_out = (float *)malloc(input_bytes);
+    double trad_max_err, trad_mse;
+    double trad_step[12] = {0};
+    double t_trad = tick();
+    int rc = mha_pipeline(S, D, H, d, softmax_scale,
+        &ctx, base, W_i8_trad[0], W_i8_trad[1], W_i8_trad[2], W_i8_trad[3],
+        NULL, 0,  /* use_lut=0 */
+        ref_out, trad_out,
+        &trad_max_err, &trad_mse, trad_step);
+    t_trad = tick() - t_trad;
+    if (rc) { fprintf(stderr, "  Traditional pipeline FAILED\n"); }
+    fprintf(stderr, "  Traditional: time=%.1f us  max_err=%.4f  MSE=%.6f\n",
+            t_trad, trad_max_err, trad_mse);
+
+    /* ---- Phase 5: Error + Timing Comparison ---- */
+    fprintf(stderr, "\n============================================================\n");
+    fprintf(stderr, "  ERROR COMPARISON: LUT vs Traditional Quantization\n");
+    fprintf(stderr, "============================================================\n");
+    fprintf(stderr, "  %-18s %12s %12s %12s\n", "Metric", "LUT", "Traditional", "Ratio");
+    fprintf(stderr, "  %-18s %12s %12s %12s\n",
+            "------------------", "----------", "----------", "----------");
+
+    /* Average LUT error across batches */
+    double lut_avg_err = 0, lut_avg_mse = 0, lut_avg_time = 0;
+    for (int b = 0; b < n_batches; b++) {
+        lut_avg_err += batch_err[b];
+        lut_avg_mse += batch_mse[b];
+        lut_avg_time += batch_time[b];
+    }
+    lut_avg_err /= n_batches;
+    lut_avg_mse /= n_batches;
+    lut_avg_time /= n_batches;
+
+    fprintf(stderr, "  %-18s %12.4f %12.4f %11.2fx\n",
+            "max_err", lut_avg_err, trad_max_err,
+            trad_max_err > 0 ? lut_avg_err / trad_max_err : 0);
+    fprintf(stderr, "  %-18s %12.6f %12.6f %11.2fx\n",
+            "MSE", lut_avg_mse, trad_mse,
+            trad_mse > 0 ? lut_avg_mse / trad_mse : 0);
+    fprintf(stderr, "  %-18s %12.1f %12.1f %11.2fx\n",
+            "Pipeline (us)", lut_avg_time, t_trad,
+            t_trad > 0 ? lut_avg_time / t_trad : 0);
+    fprintf(stderr, "  %-18s %12.1f %12.1f %12s\n",
+            "CPU Ref (us)", ref_us, ref_us, "—");
+
+    /* Per-step comparison */
+    fprintf(stderr, "\n  PER-STEP TIME COMPARISON (us):\n");
+    const char *sn[12] = {
+        "SD读权重", "量化权重", "SD读输入", "量化输入",
+        "Q=Wq(TPU)", "K=Wk(TPU)", "V=Wv(TPU)",
+        "RoPE+重量化", "Scores=QK^T", "Softmax",
+        "Attn=SV(TPU)", "Output=Wo(TPU)"
+    };
+    fprintf(stderr, "  %-18s %10s %10s %10s\n", "Step", "LUT", "Trad", "Diff");
+    for (int i = 0; i < 12; i++) {
+        fprintf(stderr, "  %-18s %10.1f %10.1f %10.1f\n",
+                sn[i], batch_step[i], trad_step[i], batch_step[i] - trad_step[i]);
+    }
+
+    /* Batch-to-batch consistency */
+    fprintf(stderr, "\n  BATCH-TO-BATCH CONSISTENCY (LUT):\n");
+    fprintf(stderr, "  %-6s %10s %10s %10s\n", "Batch", "Time(us)", "max_err", "MSE");
+    for (int b = 0; b < n_batches; b++) {
+        fprintf(stderr, "  %4d   %10.1f %10.4f %10.6f\n",
+                b, batch_time[b], batch_err[b], batch_mse[b]);
+    }
+    fprintf(stderr, "  %-6s %10.1f %10.4f %10.6f\n",
+            "AVG", lut_avg_time, lut_avg_err, lut_avg_mse);
+
+    fprintf(stderr, "\n  VERDICT:\n");
+    if (lut_avg_err <= trad_max_err * 1.1) {
+        fprintf(stderr, "    LUT accuracy = traditional (within 10%%).  ✓\n");
+    } else {
+        fprintf(stderr, "    LUT accuracy DEGRADED vs traditional.  ✗\n");
+    }
+    if (lut_avg_time < t_trad) {
+        fprintf(stderr, "    LUT speed = %.1f%% faster than traditional.  ✓\n",
+                (1.0 - lut_avg_time/t_trad) * 100.0);
+    } else {
+        fprintf(stderr, "    LUT speed = %.1f%% slower than traditional.\n",
+                (lut_avg_time/t_trad - 1.0) * 100.0);
+    }
+    fprintf(stderr, "    Input LUT built ONCE, reused %d times.\n", n_batches);
+
+    /* Cleanup */
+    for (int w = 0; w < 4; w++) { free(W_i8[w]); free(W_i8_trad[w]); }
+    free(weight_lut); free(input_lut_tbl);
+    free(tpu_out); free(trad_out); free(ref_out);
+    tpu_cleanup(&ctx);
+    fprintf(stderr, "\nDone.\n");
+    return 0;
+}

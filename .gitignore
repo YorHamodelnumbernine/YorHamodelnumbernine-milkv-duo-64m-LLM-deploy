@@ -1,0 +1,74 @@
+# Compiled binaries
+*.o
+*.obj
+!*.o.cmd
+
+# Executables (cross-compiled RISC-V)
+batch_latency
+bias_chlq_test
+bmk_failing_test
+chip_info
+cvk_100bench
+diag_bm
+diag_bm_dw
+diag_lmem
+gen_rand_weights
+max_batch
+mha_attention
+mha_mailbox_test
+mha_multi_batch
+mha_multi_batch_pipeline
+mha_sdcard_full
+mha_sdcard_lut
+mha_sdcard_multi
+mha_sdcard_pipeline
+mha_sdcard_step0
+path_cmp
+pool_c2_test
+smollm2_demo
+smollm2_pool_demo
+transformer_demo
+transp_diag
+transp_size_test
+
+# Subdirectory: ignore compiled binaries, keep *.c source
+01_conv/*
+!01_conv/*.c
+!01_conv/.diag/
+02_matmul/*
+!02_matmul/*.c
+03_elemwise/*
+!03_elemwise/*.c
+04_logic/*
+!04_logic/*.c
+05_shift_copy/*
+!05_shift_copy/*.c
+06_lookup/*
+!06_lookup/*.c
+07_pooling/*
+!07_pooling/*.c
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated reports
+*.html
+
+# Firmware binaries
+*.bin
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.map
+*.dis
+*.elf
