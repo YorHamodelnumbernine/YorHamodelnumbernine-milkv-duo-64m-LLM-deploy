@@ -33,6 +33,23 @@ def quantize_i8(data: np.ndarray):
     q = np.clip(np.round(data / scale), -128, 127).astype(np.int8)
     return q, scale
 
+def quantize_i8_per_channel(data: np.ndarray):
+    """Per-column (output-channel) symmetric INT8 quantization.
+    data shape: [in_features, out_features] (column-major convention for matmul).
+    Returns (i8_data, scales_array) where scales_array has one scale per column.
+    Each COLUMN is quantized independently to use the full INT8 range."""
+    K, N = data.shape
+    i8 = np.zeros((K, N), dtype=np.int8)
+    scales = np.zeros(N, dtype=np.float32)
+    for j in range(N):
+        col = data[:, j]
+        absmax = float(np.max(np.abs(col)))
+        if absmax < 1e-10:
+            absmax = 1.0
+        scales[j] = absmax / 127.0
+        i8[:, j] = np.clip(np.round(col / scales[j]), -128, 127).astype(np.int8)
+    return i8, scales
+
 def write_f32(path, data: np.ndarray):
     data.astype(np.float32).tofile(path)
     print(f"  {Path(path).name:30s}  {str(data.shape):20s}  {data.nbytes:>8d} B")
@@ -42,11 +59,15 @@ def write_i8(path, data: np.ndarray, scale: float = 0):
     print(f"  {Path(path).name:30s}  {str(data.shape):20s}  {data.nbytes:>8d} B  sc={scale:.6f}")
 
 def write_layer_bin(path, parts):
-    """Write merged layer.bin: concatenate list of (tensor, dtype) tuples."""
-    flat_parts = [p.astype(dt).ravel() for p, dt in parts]
-    merged = np.concatenate(flat_parts)
-    merged.tofile(path)
-    total = sum(p.nbytes for p, _ in parts)
+    """Write merged layer.bin: concatenate list of (tensor, dtype) tuples.
+    FP32 parts are 4 bytes/elem, INT8 parts are 1 byte/elem — write raw bytes
+    to avoid numpy dtype promotion."""
+    with open(path, 'wb') as f:
+        total = 0
+        for p, dt in parts:
+            arr = p.astype(dt).ravel()
+            f.write(arr.tobytes())
+            total += arr.nbytes
     print(f"  {Path(path).name:30s}  {'merged 9 tensors':20s}  {total:>8d} B")
 
 def download_model(model_id, cache_dir):
@@ -190,14 +211,40 @@ def main():
     print(f"\n[2/4] Extracting and quantizing weights...")
     total_bytes = 0
 
+    # Collect per-tensor quantization scales for dequantization in C code.
+    # Layout: [embed_scale, L0_Wq, L0_Wk, L0_Wv, L0_Wo, L0_up, L0_gate, L0_down, L1_Wq, ...]
+    all_scales = []
+
     # Embedding (weight-tied with lm_head in SmolLM2)
     # HF format: [vocab, d_model], we keep this layout
+    # Per-row quantization: each vocab row gets its own scale for MUCH
+    # better precision than per-tensor.  This is critical because the
+    # LM Head uses the same matrix to produce logits — a single scale
+    # across 49152 rows causes certain tokens to dominate.
     embed_key = "model.embed_tokens.weight"
     embed_w = state[embed_key]
     print(f"  {embed_key}: {embed_w.shape}  dtype={embed_w.dtype}")
-    embed_i8, embed_sc = quantize_i8(embed_w.astype(np.float32))
+    embed_f32 = embed_w.astype(np.float32)
+    embed_i8 = np.zeros((vocab_size, d_model), dtype=np.int8)
+    embed_scales = np.zeros(vocab_size, dtype=np.float32)
+    for v in range(vocab_size):
+        row = embed_f32[v]
+        q, sc = quantize_i8(row)
+        embed_i8[v] = q
+        embed_scales[v] = sc
+    # Store the per-tensor embed scale in all_scales[0] for backwards compat;
+    # the C code will use embed_scales.f32 for per-row dequant instead.
+    embed_sc = float(np.max(np.abs(embed_f32))) / 127.0
+    all_scales.append(embed_sc)
     write_i8(str(out / "embed.i8"), embed_i8, embed_sc)
     total_bytes += embed_i8.nbytes
+    # Save per-row embed scales
+    embed_scales_path = str(out / "embed_scales.f32")
+    embed_scales.tofile(embed_scales_path)
+    print(f"  embed_scales.f32: {vocab_size} per-row scales, {embed_scales.nbytes} B")
+    total_bytes += embed_scales.nbytes
+
+    l_scales = []  # per-channel scales for each layer, saved as layer_scales.bin
 
     for l in range(n_layers):
         prefix = f"model.layers.{l}"
@@ -212,10 +259,13 @@ def main():
         wv = state[f"{prefix}.self_attn.v_proj.weight"].astype(np.float32).T
         wo = state[f"{prefix}.self_attn.o_proj.weight"].astype(np.float32).T
 
-        wq_i8, _ = quantize_i8(np.ascontiguousarray(wq))
-        wk_i8, _ = quantize_i8(np.ascontiguousarray(wk))
-        wv_i8, _ = quantize_i8(np.ascontiguousarray(wv))
-        wo_i8, _ = quantize_i8(np.ascontiguousarray(wo))
+        # Per-channel quantization for each weight matrix.
+        # Each output channel (column of transposed matrix) gets its own scale.
+        # This dramatically improves precision over per-tensor quantization.
+        wq_i8, wq_scs = quantize_i8_per_channel(np.ascontiguousarray(wq))
+        wk_i8, wk_scs = quantize_i8_per_channel(np.ascontiguousarray(wk))
+        wv_i8, wv_scs = quantize_i8_per_channel(np.ascontiguousarray(wv))
+        wo_i8, wo_scs = quantize_i8_per_channel(np.ascontiguousarray(wo))
 
         # RMS Norm (post_attention_layernorm)
         rms_ffn = state[f"{prefix}.post_attention_layernorm.weight"].astype(np.float32)
@@ -225,9 +275,18 @@ def main():
         w_gate = state[f"{prefix}.mlp.gate_proj.weight"].astype(np.float32).T
         w_down = state[f"{prefix}.mlp.down_proj.weight"].astype(np.float32).T
 
-        up_i8, _ = quantize_i8(np.ascontiguousarray(w_up))
-        gate_i8, _ = quantize_i8(np.ascontiguousarray(w_gate))
-        down_i8, _ = quantize_i8(np.ascontiguousarray(w_down))
+        up_i8, up_scs = quantize_i8_per_channel(np.ascontiguousarray(w_up))
+        gate_i8, gate_scs = quantize_i8_per_channel(np.ascontiguousarray(w_gate))
+        down_i8, down_scs = quantize_i8_per_channel(np.ascontiguousarray(w_down))
+
+        # Keep per-tensor scales for backwards compat with all_scales
+        all_scales.extend([
+            0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,  # not used (per-channel)
+        ])
+
+        # Accumulate per-channel scales for layer_scales.bin
+        l_scales.append(np.concatenate([wq_scs, wk_scs, wv_scs, wo_scs,
+                                         up_scs, gate_scs, down_scs]))
 
         # Write merged layerN.bin: rms_attn|Wq|Wk|Wv|Wo|rms_ffn|up|gate|down
         write_layer_bin(str(out / f"layer{l}.bin"), [
@@ -240,10 +299,29 @@ def main():
         total_bytes += wq_i8.nbytes + wk_i8.nbytes + wv_i8.nbytes + wo_i8.nbytes
         total_bytes += up_i8.nbytes + gate_i8.nbytes + down_i8.nbytes
 
+    # Save per-channel layer scales (one file with all 30 layers)
+    lscales_flat = np.concatenate(l_scales)
+    lscales_path = str(out / "layer_scales.bin")
+    lscales_flat.tofile(lscales_path)
+    sc_per_layer = len(l_scales[0])
+    print(f"  layer_scales.bin: {n_layers}×{sc_per_layer}={len(lscales_flat)} scales, {lscales_flat.nbytes} B")
+    total_bytes += lscales_flat.nbytes
+
     # Final RMS Norm
     final_rms = state["model.norm.weight"].astype(np.float32)
     write_f32(str(out / "final_rms.f32"), final_rms)
     total_bytes += final_rms.nbytes
+
+    # Write per-tensor quantization scales (needed by C inference code for dequant)
+    n_scales = len(all_scales)  # 1 embed + 30*7 = 211
+    # Pad to 212 for alignment with C code's malloc(212*4)
+    while len(all_scales) < 212:
+        all_scales.append(0.0)
+    scales_arr = np.array(all_scales, dtype=np.float32)
+    scales_path = str(out / "scales.bin")
+    scales_arr.tofile(scales_path)
+    print(f"  scales.bin: {n_scales} scales ({len(all_scales)} with padding), {scales_arr.nbytes} B")
+    total_bytes += scales_arr.nbytes
 
     print(f"\n[3/4] Summary:")
     print(f"  Weight files: {len(list(out.glob('*')))}")

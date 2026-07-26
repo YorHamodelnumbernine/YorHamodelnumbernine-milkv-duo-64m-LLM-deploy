@@ -36,6 +36,8 @@ typedef struct {
 } sm_cfg_t;
 
 static float *g_scales = NULL;
+static float *g_embed_scales = NULL;   /* per-row embed scales, 49152 floats */
+static float *g_layer_scales = NULL;   /* per-channel layer scales */
 #define EMBED_SCALE       (g_scales ? g_scales[0] : 0.01544f)
 #define W_SCALE(l, idx)   (g_scales ? g_scales[1 + (l)*7 + (idx)] : 0.001f)
 
@@ -120,10 +122,84 @@ static void softmax_f32(float *buf, int rows, int cols) {
     }
 }
 
+static int get_swap_kb(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[128]; int swap = 0;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "VmSwap: %d kB", &swap) == 1) break;
+    fclose(f);
+    return swap;
+}
+
 static int sample_argmax(const float *logits, int n) {
     int best = 0; float best_v = logits[0];
     for (int i = 1; i < n; i++) if (logits[i] > best_v) { best_v = logits[i]; best = i; }
+    /* Print top-5 for diagnosis */
+    int top5[5] = {0,0,0,0,0};
+    float top5v[5] = {-1e30f, -1e30f, -1e30f, -1e30f, -1e30f};
+    for (int i = 0; i < n; i++) {
+        float v = logits[i];
+        int pos = 5;
+        for (int k = 0; k < 5; k++) {
+            if (v > top5v[k]) { pos = k; break; }
+        }
+        if (pos < 5) {
+            for (int m = 4; m > pos; m--) { top5[m] = top5[m-1]; top5v[m] = top5v[m-1]; }
+            top5[pos] = i; top5v[pos] = v;
+        }
+    }
+    fprintf(stderr, "  [logits] #1=%d(%.1f) #2=%d(%.1f) #3=%d(%.1f) #4=%d(%.1f) #5=%d(%.1f) | gap=%.1f\n",
+            top5[0], top5v[0], top5[1], top5v[1], top5[2], top5v[2],
+            top5[3], top5v[3], top5[4], top5v[4], top5v[0] - top5v[1]);
     return best;
+}
+
+/* xorshift32 PRNG — fast, no libc dependency */
+static uint32_t xorshift_state = 42;
+static uint32_t xorshift32(void) {
+    uint32_t x = xorshift_state;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    xorshift_state = x;
+    return x;
+}
+static float randf(void) {
+    return (float)(xorshift32() & 0xFFFFFF) / (float)(0xFFFFFF + 1);
+}
+
+/* Temperature softmax sampling: lower T = more greedy, higher T = more random.
+ * Returns a token ID sampled from the softmax distribution. */
+static int sample_softmax(const float *logits, int n, float temperature, int top_k) {
+    /* Find top-k indices first */
+    typedef struct { int id; float v; } kv_t;
+    kv_t top[50]; /* enough for top_k up to 50 */
+    int n_top = (top_k > 0 && top_k < 50) ? top_k : 50;
+    for (int i = 0; i < n_top; i++) { top[i].id = -1; top[i].v = -1e30f; }
+    for (int i = 0; i < n; i++) {
+        float v = logits[i];
+        int pos = n_top;
+        for (int k = 0; k < n_top; k++) { if (v > top[k].v) { pos = k; break; } }
+        if (pos < n_top) {
+            for (int m = n_top - 1; m > pos; m--) { top[m] = top[m-1]; }
+            top[pos].id = i; top[pos].v = v;
+        }
+    }
+    /* Compute softmax over top-k with temperature */
+    double sum = 0.0, probs[50];
+    for (int i = 0; i < n_top; i++) {
+        if (top[i].id < 0) { probs[i] = 0; continue; }
+        probs[i] = exp((double)(top[i].v / temperature));
+        sum += probs[i];
+    }
+    if (sum < 1e-30) return top[0].id; /* fallback */
+    /* Sample */
+    double r = randf() * sum;
+    for (int i = 0; i < n_top; i++) {
+        if (top[i].id < 0) continue;
+        r -= probs[i];
+        if (r <= 0) return top[i].id;
+    }
+    return top[0].id;
 }
 
 /* ================================================================
@@ -325,32 +401,79 @@ static void sm_setup_ptrs(sm_layer_w_t *w, uint8_t *base, int D, int dkv, int F)
 }
 
 /* ================================================================
- *  KV Cache — stored in ION (CPU-accessible via vaddr), freeing
- *  ~3 MB DDR for the weight pool.
+ *  Static work buffers for sm_layer_forward — allocated ONCE,
+ *  reused across all layers/steps.  Eliminates 15-20 malloc/free
+ *  calls per layer invocation (~450-600 per token generated).
+ *
+ *  Sizes are hardcoded for CHUNK_PREFILL=10, max_kv=64, D=576,
+ *  dkv=192, F=1536, d=64, groups=3.
  * ================================================================ */
+#define WORK_MAX_SEQ   10
+#define WORK_MAX_KV    64
+#define WORK_D         576
+#define WORK_DKV       192
+#define WORK_F         1536
+#define WORK_D_HEAD    64
+#define WORK_GROUPS    3
+
+/* Float pool layout (~224 KB):
+ *   normed(23K) + Q_f32(23K) + K_f32(7.7K) + V_f32(7.7K) +
+ *   Attn_out(23K) + group_buf(16K) + up_f32(61K) + gate_f32(61K)
+ *   Wo_out overlaps Q_f32 (sequential). ffn_out overlaps gate_f32. */
+#define WF_NORMED      0
+#define WF_Q_F32       (WF_NORMED    + WORK_MAX_SEQ * WORK_D * 4)
+#define WF_K_F32       (WF_Q_F32     + WORK_MAX_SEQ * WORK_D * 4)
+#define WF_V_F32       (WF_K_F32     + WORK_MAX_SEQ * WORK_DKV * 4)
+#define WF_ATTN_OUT    (WF_V_F32     + WORK_MAX_SEQ * WORK_DKV * 4)
+#define WF_GROUP_BUF   (WF_ATTN_OUT  + WORK_MAX_SEQ * WORK_D * 4)
+#define WF_UP_F32      (WF_GROUP_BUF + WORK_MAX_KV * WORK_D_HEAD * 4)
+#define WF_GATE_F32    (WF_UP_F32    + WORK_MAX_SEQ * WORK_F * 4)
+/* Wo_out overlaps Q_f32 (Q_f32 unused after attention-prep loop). */
+#define WF_WO_OUT      WF_Q_F32
+/* ffn_out overlaps gate_f32 (gate_f32 freed after silu*gate multiply). */
+#define WF_FFN_OUT     WF_GATE_F32
+#define WORK_F32_SZ    (WF_GATE_F32 + WORK_MAX_SEQ * WORK_F * 4)
+
+/* INT8 pool layout (~51 KB):
+ *   x_i8(5.8K) + Q_i8(5.8K) + K_i8(1.9K) + V_i8(1.9K) +
+ *   Kh_i8_tmp(4.1K) + up_i8(15K) + gate_i8(15K)
+ *   O_i8 overlaps Q_i8 (sequential). down_i8 overlaps x_i8. */
+#define WI_X_I8        0
+#define WI_Q_I8        (WI_X_I8     + WORK_MAX_SEQ * WORK_D)
+#define WI_K_I8        (WI_Q_I8     + WORK_MAX_SEQ * WORK_D)
+#define WI_V_I8        (WI_K_I8     + WORK_MAX_SEQ * WORK_DKV)
+#define WI_KH_I8_TMP   (WI_V_I8     + WORK_MAX_SEQ * WORK_DKV)
+#define WI_UP_I8       (WI_KH_I8_TMP + WORK_MAX_KV * WORK_D_HEAD)
+#define WI_GATE_I8     (WI_UP_I8    + WORK_MAX_SEQ * WORK_F)
+/* O_i8 overlaps Q_i8 (Q_i8 freed after dequant). */
+#define WI_O_I8        WI_Q_I8
+/* down_i8 overlaps x_i8 (x_i8 freed after FFN up+gate matmuls). */
+#define WI_DOWN_I8     WI_X_I8
+#define WORK_I8_SZ     (WI_GATE_I8 + WORK_MAX_SEQ * WORK_F)
+
+/* ================================================================
+ *  KV Cache — stored in ION (CPU-accessible via vaddr), freeing
+ *  ~3 MB Linux heap and reducing swap pressure.
+ *
+ *  ION layout (24MB):
+ *    [Weight slots (variable)] [Embed cache] [KV cache (grows from end)]
+ *
+ *  KV cache at top of ION means weight slots + embed cache compete
+ *  for remaining space.  As max_seq grows, weight slots naturally
+ *  decrease — no arbitrary kv_len thresholds needed.
+ * ================================================================ */
+struct pool_t;  /* forward declaration */
+
 typedef struct {
-    float *K[30], *V[30]; /* per-layer KV buffers */
+    float *K[30], *V[30]; /* per-layer KV buffers (pointers into ION) */
 } sm_kv_cache_t;
 
-static sm_kv_cache_t *sm_kv_alloc(CVI_RT_HANDLE rt, const sm_cfg_t *c) {
-    sm_kv_cache_t *kv = (sm_kv_cache_t*)calloc(1, sizeof(sm_kv_cache_t));
-    if (!kv) return NULL;
-    int per_layer = c->max_seq * c->d_qkv * sizeof(float);
-    for (int l = 0; l < c->n_layers; l++) {
-        kv->K[l] = (float *)calloc(per_layer, 1);
-        kv->V[l] = (float *)calloc(per_layer, 1);
-        if (!kv->K[l] || !kv->V[l]) {
-            for (int j = 0; j <= l; j++) { free(kv->K[j]); free(kv->V[j]); }
-            free(kv); return NULL;
-        }
-    }
-    return kv;
-}
+/* Implementation below, after pool_t is fully defined */
 
 static void sm_kv_free(sm_kv_cache_t *kv, const sm_cfg_t *c, CVI_RT_HANDLE rt) {
+    /* Buffers are inside ION — freed with pool.  Only the struct is on heap. */
     if (!kv) return;
-    (void)rt;
-    for (int l = 0; l < c->n_layers; l++) { free(kv->K[l]); free(kv->V[l]); }
+    (void)c; (void)rt;
     free(kv);
 }
 static void sm_kv_store_contig(float *cache, const float *new_data, int seq, int pos, int dkv) {
@@ -370,43 +493,75 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
     float *x, int seq, int pos, int kv_len,
     sm_kv_cache_t *kv, int layer,
     float *rope_cos, float *rope_sin,
-    double *timing)
+    double *timing,
+    uint8_t *work_f32, uint8_t *work_i8)
 {
     int D=c->D, H=c->n_heads, Kvh=c->n_kv_heads, d=c->head_dim;
     int dkv=c->d_qkv, F=c->FFN, groups=c->n_groups;
     int total=seq*D; double ts;
     int rc;
 
+    /* ---- Per-channel layer scale offsets ---- */
+    int ls_pl = D + dkv + dkv + D + F + F + D;
+    int ls_wq=0, ls_wk=D, ls_wv=D+dkv, ls_wo=D+2*dkv;
+    int ls_up=D*2+2*dkv, ls_gate=ls_up+F, ls_down=ls_gate+F;
+    float *lsc = g_layer_scales ? g_layer_scales + layer * ls_pl : NULL;
+
+    /* ---- Static buffer pointers (from pre-allocated pools) ---- */
+    float *normed   = (float *)(work_f32 + WF_NORMED);
+    float *Q_f32    = (float *)(work_f32 + WF_Q_F32);
+    float *K_f32    = (float *)(work_f32 + WF_K_F32);
+    float *V_f32    = (float *)(work_f32 + WF_V_F32);
+    float *Attn_out = (float *)(work_f32 + WF_ATTN_OUT);
+    float *grp_buf  = (float *)(work_f32 + WF_GROUP_BUF);  /* Qg/Kh/Scores/Vh */
+    float *Wo_out   = (float *)(work_f32 + WF_WO_OUT);     /* overlaps Q_f32 */
+    float *up_f32   = (float *)(work_f32 + WF_UP_F32);
+    float *gate_f32 = (float *)(work_f32 + WF_GATE_F32);
+    float *ffn_out  = (float *)(work_f32 + WF_FFN_OUT);    /* overlaps gate_f32 */
+
+    int8_t *x_i8      = (int8_t *)(work_i8 + WI_X_I8);
+    int8_t *Q_i8      = (int8_t *)(work_i8 + WI_Q_I8);
+    int8_t *K_i8      = (int8_t *)(work_i8 + WI_K_I8);
+    int8_t *V_i8      = (int8_t *)(work_i8 + WI_V_I8);
+    int8_t *Kh_i8_tmp = (int8_t *)(work_i8 + WI_KH_I8_TMP);
+    int8_t *O_i8      = (int8_t *)(work_i8 + WI_O_I8);     /* overlaps Q_i8 */
+    int8_t *up_i8     = (int8_t *)(work_i8 + WI_UP_I8);
+    int8_t *gate_i8   = (int8_t *)(work_i8 + WI_GATE_I8);
+    int8_t *down_i8   = (int8_t *)(work_i8 + WI_DOWN_I8);  /* overlaps x_i8 */
+
+    /* ---- RMS attn norm ---- */
     ts=TICK();
-    float *normed=(float*)malloc(total*sizeof(float));
-    if(!normed){fprintf(stderr,"    L%d: normed OOM\n",layer);return-1;}
     rms_norm_f32(normed, x, w->rms_attn, seq, D, 1e-6f);
     timing[0]+=TICK()-ts;
 
     float sc_x=compute_scale_sym(normed, total);
-    int8_t *x_i8=(int8_t*)malloc(total);
-    if(!x_i8){fprintf(stderr,"    L%d: x_i8 OOM\n",layer);free(normed);return-1;}
     quantize_i8_sym(x_i8, normed, total, sc_x);
 
-    /* ---- Q, K, V matmuls: use tpu_matmul (proven with M=3 in Tests 1-4) ---- */
-    int rshift_qkv=matmul_rshift(D);
-    int wq_sz=seq*D, wk_sz=seq*dkv, wv_sz=seq*dkv;
-    int8_t *Q_i8=(int8_t*)malloc(wq_sz),*K_i8=(int8_t*)malloc(wk_sz),*V_i8=(int8_t*)malloc(wv_sz);
-    if(!Q_i8||!K_i8||!V_i8){fprintf(stderr,"    L%d: QKV OOM\n",layer);free(Q_i8);free(K_i8);free(V_i8);free(x_i8);free(normed);return-1;}
+    /* ---- Q, K, V matmuls ---- */
+    int rshift_qkv=matmul_rshift(D) - 5; if (rshift_qkv < 8) rshift_qkv = 8;
     ts=TICK();
     rc = tpu_matmul(ctx,cvk,x_i8,seq,D,w->Wq,D, Q_i8,SM_SCRATCH_OFF,rshift_qkv);
     if(!rc) rc = tpu_matmul(ctx,cvk,x_i8,seq,D,w->Wk,dkv, K_i8,SM_SCRATCH_OFF,rshift_qkv);
     if(!rc) rc = tpu_matmul(ctx,cvk,x_i8,seq,D,w->Wv,dkv, V_i8,SM_SCRATCH_OFF,rshift_qkv);
-    if(rc){fprintf(stderr,"    L%d: QKV FAIL rc=%d\n",layer,rc); free(Q_i8);free(K_i8);free(V_i8);free(x_i8);free(normed);return rc;}
-    timing[1]+=TICK()-ts; free(x_i8);
+    if(rc){fprintf(stderr,"    L%d: QKV FAIL rc=%d\n",layer,rc); return rc;}
+    timing[1]+=TICK()-ts;
 
-    /* ---- Dequant Q, K, V ---- */
-    float *Q_f32=(float*)malloc(seq*D*sizeof(float)),*K_f32=(float*)malloc(seq*dkv*sizeof(float)),*V_f32=(float*)malloc(seq*dkv*sizeof(float));
-    if(!Q_f32||!K_f32||!V_f32){fprintf(stderr,"    L%d: dequant OOM\n",layer);free(Q_i8);free(K_i8);free(V_i8);free(normed);return-1;}
-    dequant_i8(Q_f32,Q_i8,seq*D,W_SCALE(layer,0),sc_x,rshift_qkv);
-    dequant_i8(K_f32,K_i8,seq*dkv,W_SCALE(layer,1),sc_x,rshift_qkv);
-    dequant_i8(V_f32,V_i8,seq*dkv,W_SCALE(layer,2),sc_x,rshift_qkv);
-    free(Q_i8);free(K_i8);free(V_i8);
+    /* ---- Dequant Q, K, V (per-channel) ---- */
+    if (lsc) {
+        float b = sc_x * (float)(1 << rshift_qkv);
+        for (int i = 0; i < seq; i++) {
+            for (int j = 0; j < D; j++)
+                Q_f32[i*D+j] = (float)Q_i8[i*D+j] * b * lsc[ls_wq+j];
+            for (int j = 0; j < dkv; j++) {
+                K_f32[i*dkv+j] = (float)K_i8[i*dkv+j] * b * lsc[ls_wk+j];
+                V_f32[i*dkv+j] = (float)V_i8[i*dkv+j] * b * lsc[ls_wv+j];
+            }
+        }
+    } else {
+        dequant_i8(Q_f32,Q_i8,seq*D,W_SCALE(layer,0),sc_x,rshift_qkv);
+        dequant_i8(K_f32,K_i8,seq*dkv,W_SCALE(layer,1),sc_x,rshift_qkv);
+        dequant_i8(V_f32,V_i8,seq*dkv,W_SCALE(layer,2),sc_x,rshift_qkv);
+    }
 
     /* ---- RoPE ---- */
     ts=TICK();
@@ -416,45 +571,43 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
     }
     timing[4]+=TICK()-ts;
 
-    /* ---- KV cache store + load ---- */
+    /* ---- KV cache store ---- */
     ts=TICK();
     sm_kv_store_contig(kv->K[layer],K_f32,seq,pos,dkv);
     sm_kv_store_contig(kv->V[layer],V_f32,seq,pos,dkv);
     timing[5]+=TICK()-ts;
 
-    float *K_full=(float*)malloc(kv_len*dkv*sizeof(float)),*V_full=(float*)malloc(kv_len*dkv*sizeof(float));
-    if(!K_full||!V_full){fprintf(stderr,"    L%d: K_full OOM\n",layer);free(Q_f32);free(K_f32);free(V_f32);free(normed);return-1;}
-    sm_kv_load_contig(K_full,kv->K[layer],kv_len,dkv);
-    sm_kv_load_contig(V_full,kv->V[layer],kv_len,dkv);
+    /* ---- KV cache now in ION — read directly, no K_full/V_full copy ---- */
 
     /* ---- Attention: prep Qg, Kt in neuron memory ---- */
     float softmax_scale=1.0f/sqrtf((float)d);
-    float *Attn_out=(float*)calloc(seq*D,sizeof(float));
-    int rshift_scores=matmul_rshift(d);
+    memset(Attn_out, 0, seq*D*sizeof(float));
+    int rshift_scores=matmul_rshift(d) - 5; if (rshift_scores < 8) rshift_scores = 8;
     int Qg_sz=seq*groups*d, Kt_sz=d*kv_len, Sg_sz=seq*groups*kv_len;
     float sc_qg[9],sc_kh[9];
 
     for(int g=0;g<Kvh;g++){
-        float *Qg_f32=(float*)malloc(Qg_sz*sizeof(float));
+        float *Qg_f32 = grp_buf;
         for(int s=0;s<seq;s++)for(int h=0;h<groups;h++)memcpy(Qg_f32+(s*groups+h)*d,Q_f32+s*D+(g*groups+h)*d,d*sizeof(float));
         sc_qg[g]=compute_scale_sym(Qg_f32,Qg_sz);
-        quantize_i8_sym((int8_t*)(nm+SM_Q_I8_OFF+g*Qg_sz),Qg_f32,Qg_sz,sc_qg[g]); free(Qg_f32);
-        float *Kh_f32=(float*)malloc(kv_len*d*sizeof(float));
-        for(int s=0;s<kv_len;s++)memcpy(Kh_f32+s*d,K_full+s*dkv+g*d,d*sizeof(float));
+        quantize_i8_sym((int8_t*)(nm+SM_Q_I8_OFF+g*Qg_sz),Qg_f32,Qg_sz,sc_qg[g]);
+
+        float *Kh_f32 = grp_buf;  /* reuse grp_buf */
+        for(int s=0;s<kv_len;s++)memcpy(Kh_f32+s*d, kv->K[layer]+s*dkv+g*d, d*sizeof(float));
         sc_kh[g]=compute_scale_sym(Kh_f32,kv_len*d);
-        int8_t *Kh_i8_tmp=(int8_t*)malloc(kv_len*d);
-        quantize_i8_sym(Kh_i8_tmp,Kh_f32,kv_len*d,sc_kh[g]); free(Kh_f32);
+        quantize_i8_sym(Kh_i8_tmp,Kh_f32,kv_len*d,sc_kh[g]);
         int8_t *Kt=(int8_t*)(nm+SM_KT_I8_OFF+g*Kt_sz);
         for(int r=0;r<kv_len;r++)for(int c=0;c<d;c++)Kt[c*kv_len+r]=Kh_i8_tmp[r*d+c];
-        free(Kh_i8_tmp);
     }
+    /* Q_f32, K_f32, V_f32 no longer needed after this point.
+     * Wo_out overlaps Q_f32 space (via WF_WO_OUT == WF_Q_F32). */
 
     /* ---- Scores: batch build all groups, single Submit ---- */
     ts=TICK();
     for(int g=0;g<Kvh;g++){
         int8_t *Qg_i8=(int8_t*)(nm+SM_Q_I8_OFF+g*Qg_sz),*Kt_g=(int8_t*)(nm+SM_KT_I8_OFF+g*Kt_sz);
         rc=tpu_matmul_build(ctx,cvk,Qg_i8,seq*groups,d,Kt_g,kv_len, SM_S_I8_OFF+g*Sg_sz,SM_SCRATCH_OFF,rshift_scores);
-        if(rc){free(K_full);free(V_full);free(Attn_out);free(Q_f32);free(K_f32);free(V_f32);free(normed);return rc;}
+        if(rc) return rc;
     }
     CVI_RT_Submit(ctx->rt_khandle);
     CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem);
@@ -465,26 +618,27 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
     ts=TICK();
     for(int g=0;g<Kvh;g++){
         int8_t *Sg_i8=(int8_t*)(nm+SM_S_I8_OFF+g*Sg_sz);
-        float *Scores_f32=(float*)malloc(seq*groups*kv_len*sizeof(float));
+        float *Scores_f32 = grp_buf;
         dequant_i8(Scores_f32,Sg_i8,seq*groups*kv_len,sc_kh[g],sc_qg[g],rshift_scores);
         for(int h=0;h<groups;h++){for(int s=0;s<seq;s++){float*row=Scores_f32+(s*groups+h)*kv_len;int mask_from=pos+s+1;for(int i=0;i<kv_len;i++){if(i>=mask_from)row[i]=-1e30f;else row[i]*=softmax_scale;}softmax_f32(row,1,kv_len);}}
         sc_sg[g]=compute_scale_sym(Scores_f32,seq*groups*kv_len);
-        quantize_i8_sym(Sg_i8,Scores_f32,seq*groups*kv_len,sc_sg[g]); free(Scores_f32);
-        float *Vh_f32=(float*)malloc(kv_len*d*sizeof(float));
-        for(int s=0;s<kv_len;s++)memcpy(Vh_f32+s*d,V_full+s*dkv+g*d,d*sizeof(float));
+        quantize_i8_sym(Sg_i8,Scores_f32,seq*groups*kv_len,sc_sg[g]);
+
+        float *Vh_f32 = grp_buf;  /* reuse grp_buf */
+        for(int s=0;s<kv_len;s++)memcpy(Vh_f32+s*d, kv->V[layer]+s*dkv+g*d, d*sizeof(float));
         sc_vh[g]=compute_scale_sym(Vh_f32,kv_len*d);
-        quantize_i8_sym((int8_t*)(nm+SM_V_I8_OFF+g*kv_len*d),Vh_f32,kv_len*d,sc_vh[g]); free(Vh_f32);
+        quantize_i8_sym((int8_t*)(nm+SM_V_I8_OFF+g*kv_len*d),Vh_f32,kv_len*d,sc_vh[g]);
     }
     timing[7]+=TICK()-ts;
 
     /* ---- Attn output: batch build all groups, single Submit ---- */
     ts=TICK();
-    int rshift_attn=matmul_rshift(kv_len);
+    int rshift_attn=matmul_rshift(kv_len) - 5; if (rshift_attn < 8) rshift_attn = 8;
     for(int g=0;g<Kvh;g++){
         rc=tpu_matmul_build(ctx,cvk,(int8_t*)(nm+SM_S_I8_OFF+g*Sg_sz),seq*groups,kv_len,
                             (int8_t*)(nm+SM_V_I8_OFF+g*kv_len*d),d,
                             SM_A_I8_OFF+g*seq*groups*d, SM_SCRATCH_OFF, rshift_attn);
-        if(rc){free(K_full);free(V_full);free(Attn_out);free(Q_f32);free(K_f32);free(V_f32);free(normed);return rc;}
+        if(rc) return rc;
     }
     CVI_RT_Submit(ctx->rt_khandle);
     CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem);
@@ -496,63 +650,75 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
         float sc_attn=sc_sg[g]*sc_vh[g]*(float)(1<<rshift_attn);
         for(int h=0;h<groups;h++){int hq=g*groups+h;for(int s=0;s<seq;s++)for(int c=0;c<d;c++)Attn_out[s*D+hq*d+c]+=(float)Ag_i8[(s*groups+h)*d+c]*sc_attn;}
     }
-    free(K_full);free(V_full);
 
-    /* ---- Wo projection ---- */
+    /* ---- Wo projection (Wo_out in Q_f32 space) ---- */
     ts=TICK();
     float sc_attn_q=compute_scale_sym(Attn_out,seq*D);
     quantize_i8_sym((int8_t*)(nm+SM_O_I8_OFF),Attn_out,seq*D,sc_attn_q);
-    int8_t *O_i8=(int8_t*)malloc(total);
-    if(!O_i8){free(Attn_out);free(Q_f32);free(K_f32);free(V_f32);free(normed);return-1;}
     rc=tpu_matmul_build(ctx,cvk,(int8_t*)(nm+SM_O_I8_OFF),seq,D,w->Wo,D, SM_Q_I8_OFF,SM_SCRATCH_OFF,rshift_qkv);
     if(!rc){CVI_RT_Submit(ctx->rt_khandle); CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem); memcpy(O_i8, nm+SM_Q_I8_OFF, total);}
     timing[9]+=TICK()-ts;
-    if(rc){free(O_i8);free(Attn_out);free(Q_f32);free(K_f32);free(V_f32);free(normed);return rc;}
-    float *Wo_out=(float*)malloc(total*sizeof(float));
-    dequant_i8(Wo_out,O_i8,total,W_SCALE(layer,3),sc_attn_q,rshift_qkv);
+    if(rc) return rc;
+    if (lsc) {
+        float b = sc_attn_q * (float)(1 << rshift_qkv);
+        for (int i = 0; i < total; i++)
+            Wo_out[i] = (float)O_i8[i] * b * lsc[ls_wo + (i % D)];
+    } else {
+        dequant_i8(Wo_out,O_i8,total,W_SCALE(layer,3),sc_attn_q,rshift_qkv);
+    }
     for(int i=0;i<total;i++)x[i]+=Wo_out[i];
-    free(Wo_out);free(O_i8);free(Attn_out);free(Q_f32);free(K_f32);free(V_f32);
 
-    /* ---- FFN: rms_norm + quantize ---- */
+    /* ---- FFN: rms_norm + quantize (reuse normed, x_i8 buffers) ---- */
     ts=TICK(); rms_norm_f32(normed,x,w->rms_ffn,seq,D,1e-6f); timing[10]+=TICK()-ts;
-    sc_x=compute_scale_sym(normed,total); x_i8=(int8_t*)malloc(total); quantize_i8_sym(x_i8,normed,total,sc_x); free(normed);
+    sc_x=compute_scale_sym(normed,total); quantize_i8_sym(x_i8,normed,total,sc_x);
 
     /* ---- FFN up + gate: batch build, single Submit ---- */
-    int rshift_ffn_up=matmul_rshift(D);
+    int rshift_ffn_up=matmul_rshift(D) - 5; if (rshift_ffn_up < 8) rshift_ffn_up = 8;
     ts=TICK();
     rc = tpu_matmul_build(ctx,cvk,x_i8,seq,D,w->ffn_up,F, SM_UP_I8_OFF,SM_SCRATCH_OFF,rshift_ffn_up);
     if(!rc) rc = tpu_matmul_build(ctx,cvk,x_i8,seq,D,w->ffn_gate,F, SM_GATE_I8_OFF,SM_SCRATCH_OFF+0x10000,rshift_ffn_up);
-    if(rc){free(x_i8);return rc;}
+    if(rc) return rc;
     CVI_RT_Submit(ctx->rt_khandle);
     CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem);
-    timing[11]+=TICK()-ts; free(x_i8);
+    timing[11]+=TICK()-ts;
 
-    int8_t *up_i8=(int8_t*)malloc(seq*F),*gate_i8=(int8_t*)malloc(seq*F);
-    if(!up_i8||!gate_i8){free(up_i8);free(gate_i8);return-1;}
     memcpy(up_i8, nm+SM_UP_I8_OFF, seq*F);
     memcpy(gate_i8, nm+SM_GATE_I8_OFF, seq*F);
 
-    float *up_f32=(float*)malloc(seq*F*sizeof(float)),*gate_f32=(float*)malloc(seq*F*sizeof(float));
-    dequant_i8(up_f32,up_i8,seq*F,W_SCALE(layer,4),sc_x,rshift_ffn_up);
-    dequant_i8(gate_f32,gate_i8,seq*F,W_SCALE(layer,5),sc_x,rshift_ffn_up);
-    free(up_i8);free(gate_i8); silu_f32(gate_f32,seq*F);
-    for(int i=0;i<seq*F;i++)up_f32[i]*=gate_f32[i]; free(gate_f32);
+    if (lsc) {
+        float b = sc_x * (float)(1 << rshift_ffn_up);
+        for (int i = 0; i < seq; i++) {
+            for (int j = 0; j < F; j++) {
+                up_f32[i*F+j]   = (float)up_i8[i*F+j]   * b * lsc[ls_up+j];
+                gate_f32[i*F+j] = (float)gate_i8[i*F+j] * b * lsc[ls_gate+j];
+            }
+        }
+    } else {
+        dequant_i8(up_f32,up_i8,seq*F,W_SCALE(layer,4),sc_x,rshift_ffn_up);
+        dequant_i8(gate_f32,gate_i8,seq*F,W_SCALE(layer,5),sc_x,rshift_ffn_up);
+    }
+    silu_f32(gate_f32,seq*F);
+    for(int i=0;i<seq*F;i++)up_f32[i]*=gate_f32[i];
 
-    /* ---- FFN down ---- */
+    /* ---- FFN down (ffn_out overlaps gate_f32) ---- */
     float sc_mid=compute_scale_sym(up_f32,seq*F);
-    quantize_i8_sym((int8_t*)(nm+SM_UP_I8_OFF),up_f32,seq*F,sc_mid); free(up_f32);
-    int rshift_ffn_down=matmul_rshift(F);
+    quantize_i8_sym((int8_t*)(nm+SM_UP_I8_OFF),up_f32,seq*F,sc_mid);
+    int rshift_ffn_down=matmul_rshift(F) - 5; if (rshift_ffn_down < 8) rshift_ffn_down = 8;
     ts=TICK();
-    int8_t *down_i8=(int8_t*)malloc(total);
-    if(!down_i8) return -1;
     rc=tpu_matmul_build(ctx,cvk,(int8_t*)(nm+SM_UP_I8_OFF),seq,F,w->ffn_down,D, SM_Q_I8_OFF,SM_SCRATCH_OFF,rshift_ffn_down);
     if(!rc){CVI_RT_Submit(ctx->rt_khandle); CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem); memcpy(down_i8, nm+SM_Q_I8_OFF, total);}
     timing[13]+=TICK()-ts;
-    if(rc){free(down_i8);return rc;}
-    float *ffn_out=(float*)malloc(total*sizeof(float));
-    dequant_i8(ffn_out,down_i8,total,W_SCALE(layer,6),sc_mid,rshift_ffn_down);
+    if(rc) return rc;
+    if (lsc) {
+        float b = sc_mid * (float)(1 << rshift_ffn_down);
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < D; j++)
+                ffn_out[i*D+j] = (float)down_i8[i*D+j] * b * lsc[ls_down+j];
+    } else {
+        dequant_i8(ffn_out,down_i8,total,W_SCALE(layer,6),sc_mid,rshift_ffn_down);
+    }
     for(int i=0;i<total;i++)x[i]+=ffn_out[i];
-    free(ffn_out);free(down_i8);
+
     return 0;
 }
 
@@ -562,6 +728,10 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
  *  Design: while TPU computes layer N, a background thread reads
  *  layer N+1 from SD into a DDR staging buffer.  This hides SD
  *  latency behind TPU compute.
+ *
+ *  One thread is created per layer (pthread_create + join).  The
+ *  Linux preemptive scheduler overlaps the SD read (thread blocks
+ *  in kernel DMA) with TPU compute on the main thread.
  *
  *  Memory: staging = 2 * layer_sz (~6.8 MB).  Fits in remaining DDR.
  * ================================================================ */
@@ -582,31 +752,42 @@ static void *pf_worker(void *arg) {
 
     snprintf(path, sizeof(path), "%s/layer%d.bin", j->weight_dir, j->layer_id);
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { j->ready = -1; return NULL; }
-    int remain = j->sz;
+    if (fd < 0) {
+        pthread_mutex_lock(&j->lock);
+        j->ready = -1;
+        pthread_cond_signal(&j->cond);
+        pthread_mutex_unlock(&j->lock);
+        return NULL;
+    }
+    int remain = j->sz, ok = 1;
     uint8_t *dst = j->buf;
     while (remain > 0) {
         int n = read(fd, dst, remain);
-        if (n <= 0) { close(fd); j->ready = -1; return NULL; }
+        if (n <= 0) { ok = 0; break; }
         dst += n; remain -= n;
     }
     close(fd);
 
     pthread_mutex_lock(&j->lock);
-    j->ready = 1;
+    j->ready = (ok && remain == 0) ? 1 : -1;
     pthread_cond_signal(&j->cond);
     pthread_mutex_unlock(&j->lock);
     return NULL;
 }
 
-static void pf_start(pf_job_t *j, const char *weight_dir, int layer_id, int sz) {
+/* Start a thread to load the layer.  Returns 0 on success, -1 if
+ * pthread_create fails (e.g. OOM). */
+static int pf_start(pf_job_t *j, const char *weight_dir, int layer_id,
+                     int sz, uint8_t *buf) {
     j->weight_dir = weight_dir;
     j->layer_id   = layer_id;
     j->sz         = sz;
+    j->buf        = buf;
     j->ready      = 0;
-    pthread_create(&j->tid, NULL, pf_worker, j);
+    return pthread_create(&j->tid, NULL, pf_worker, j);
 }
 
+/* Wait for the load thread to finish.  Returns 0 on success, -1 on error. */
 static int pf_wait(pf_job_t *j) {
     pthread_mutex_lock(&j->lock);
     while (j->ready == 0)
@@ -614,6 +795,53 @@ static int pf_wait(pf_job_t *j) {
     int r = j->ready;
     pthread_mutex_unlock(&j->lock);
     void *ret; pthread_join(j->tid, &ret);
+    return (r == 1) ? 0 : -1;
+}
+
+/* ---- Embed prefetch: async SD→ION read for LM Head chunks ---- */
+typedef struct {
+    int       embed_fd;
+    off_t     file_off;
+    int       len;
+    uint8_t  *dst;
+    int       ready;
+    pthread_t tid;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+} ef_job_t;
+
+static void *ef_worker(void *arg) {
+    ef_job_t *j = (ef_job_t *)arg;
+    pthread_mutex_lock(&j->lock);
+    lseek(j->embed_fd, j->file_off, SEEK_SET);
+    int n = read(j->embed_fd, j->dst, j->len);
+    j->ready = (n == j->len) ? 1 : -1;
+    pthread_cond_signal(&j->cond);
+    pthread_mutex_unlock(&j->lock);
+    return NULL;
+}
+
+static int ef_start(ef_job_t *j, int embed_fd, off_t off, int len, uint8_t *dst) {
+    memset(j, 0, sizeof(*j));
+    j->embed_fd  = embed_fd;
+    j->file_off  = off;
+    j->len       = len;
+    j->dst       = dst;
+    j->ready     = 0;
+    pthread_mutex_init(&j->lock, NULL);
+    pthread_cond_init(&j->cond, NULL);
+    return pthread_create(&j->tid, NULL, ef_worker, j);
+}
+
+static int ef_wait(ef_job_t *j) {
+    pthread_mutex_lock(&j->lock);
+    while (j->ready == 0)
+        pthread_cond_wait(&j->cond, &j->lock);
+    int r = j->ready;
+    pthread_mutex_unlock(&j->lock);
+    void *ret; pthread_join(j->tid, &ret);
+    pthread_mutex_destroy(&j->lock);
+    pthread_cond_destroy(&j->cond);
     return (r == 1) ? 0 : -1;
 }
 
@@ -796,7 +1024,7 @@ static int mbox_cache_flush_async(tpu_ctx *ctx, int slot,
  *  Phase 3 (lm_head): Reuse embedding in pool, transpose chunks on-the-fly.
  * ================================================================ */
 #define ION_POOL_SZ      0x1800000   /* 24 MB */
-#define DDR_POOL_TRY     0x800000    /* 8 MB — need 2x layer_sz (~6.8MB) for dual buf */
+#define DDR_POOL_TRY     0xC00000    /* 12 MB — bigger embed cache */
 #define DDR_POOL_MIN     0x400000    /* fallback 4 MB */
 #define ION_MAX_SLOTS    7           /* max layer slots in ION */
 #define DDR_MAX_OVERFLOW 5           /* max DDR overflow layers */
@@ -804,8 +1032,9 @@ static int mbox_cache_flush_async(tpu_ctx *ctx, int slot,
 
 static uint8_t io_buf[256 * 1024];   /* staging buffer in BSS — zero heap pressure */
 
-typedef struct {
+typedef struct pool_t {
     /* ION */
+    CVI_RT_HANDLE rt_handle;
     CVI_RT_MEM  ion_mem;
     uint8_t    *ion_vaddr;
     uint64_t    ion_paddr;
@@ -814,43 +1043,43 @@ typedef struct {
     uint8_t    *ddr_base;
     int         ddr_sz;
 
-    /* Embedding split */
+    /* Embedding split — DDR cache + ION cache (slot 6 during decode) + SD */
     int         embed_total;      /* D * V bytes */
     int         embed_ddr_bytes;  /* bytes of embedding stored in DDR */
-    int         embed_ion_bytes;  /* bytes of embedding stored in ION */
+    int         embed_ion_bytes;  /* bytes of embedding in ION slot 6 (decode) */
+    int         embed_ion_offset; /* byte offset in ION where embed cache starts */
 
-    /* ION layer slots (after embedding portion) */
-    int         ion_layer_off;    /* byte offset in ION where layer slots start */
+    /* ION layer slots */
+    int         ion_layer_off;    /* byte offset in ION where layer slots start (=0) */
     int         ion_n_slots;      /* actual number of layer slots in ION */
     int         ion_slot_layer[ION_MAX_SLOTS]; /* which layer is in each slot, -1=free */
-
-    /* Current batch state */
-    int         batch_start, batch_end;
-    int         ddr_layer_ids[DDR_MAX_OVERFLOW];
-    int         ddr_n_layers;     /* actual number of DDR overflow layers this batch */
-    int         ddr_max_overflow; /* computed: ddr_sz / layer_sz */
-    int         batch_target;     /* computed: ion_n_slots + ddr_max_overflow */
 
     int         layer_sz, D, dkv, F;
     char        weight_dir[256];
     int         embed_fd;         /* fd for streaming embed reads (LM Head) */
 
-    /* Dual DDR staging buffers for pipelined SD→DDR→ION */
-    uint8_t    *ddr_buf[2];       /* DDR staging, each layer_sz bytes */
-    uint64_t    ddr_buf_pa[2];    /* phys addr (0 if unresolved, local memcpy only) */
-    int         ddr_buf_loaded[2]; /* which buffer has valid data */
-    int         ddr_cur_buf;      /* current buffer index for next SD read */
+    /* Secondary core DDR->ION DMA offload (optional) */
     int         use_mbox;         /* 1 if secondary core mailbox is available */
-    uint64_t    nm_paddr;         /* cached neuron memory phys addr for mbox */
-    int         ddr_pa_done;      /* phys addr resolution attempted */
+
+    int         ion_expanded;     /* 1 after first pool_ion_expand_for_batch */
+    int         pipeline_mode;    /* 3=3+3, 2=2+2, 1=1+1 — downgrade as KV grows */
+
+    /* KV cache in ION (top of ION, grows downward) */
+    int         kv_bytes;         /* total KV cache bytes in ION */
+    int         kv_start;         /* byte offset in ION where KV cache starts */
+    int         ion_free;         /* bytes between 0 and kv_start for weights+embed */
+
+    /* Static work buffers — allocated once, reused across all sm_layer_forward calls */
+    uint8_t    *work_f32;         /* float working pool, ~224 KB */
+    uint8_t    *work_i8;          /* int8 working pool, ~51 KB */
 } pool_t;
 
 static void pool_free(pool_t *p, CVI_RT_HANDLE rt) {
     if (p->embed_fd >= 0) { close(p->embed_fd); p->embed_fd = -1; }
     if (p->ion_mem) { CVI_RT_MemFree(rt, p->ion_mem); p->ion_mem = NULL; }
     free(p->ddr_base);
-    free(p->ddr_buf[0]);
-    free(p->ddr_buf[1]);
+    free(p->work_f32);
+    free(p->work_i8);
     mbox_close();
     memset(p, 0, sizeof(*p));
 }
@@ -858,6 +1087,7 @@ static void pool_free(pool_t *p, CVI_RT_HANDLE rt) {
 static int pool_init(pool_t *p, CVI_RT_HANDLE rt, const char *weight_dir,
                      int D, int dkv, int F) {
     memset(p, 0, sizeof(*p));
+    p->rt_handle = rt;
     p->D = D; p->dkv = dkv; p->F = F;
     p->layer_sz = sm_layer_bytes(D, dkv, F);
     p->embed_total = D * 49152;  /* vocab=49152, weight-tied with lm_head */
@@ -882,66 +1112,100 @@ static int pool_init(pool_t *p, CVI_RT_HANDLE rt, const char *weight_dir,
             DDR_POOL_MIN/1024/1024); pool_free(p, rt); return -1; }
     p->ddr_sz = ddr_try;
 
-    /* --- Decide embedding split: DDR first, rest in ION.
-     *   Reserve up to 2*layer_sz for dual staging buffers (post-expand).
-     *   If DDR is too small for 2 full buffers, fall back to 1 buffer. --- */
-    int ddr_staging_needed = p->layer_sz * 2;
-    if (ddr_staging_needed > (int)p->ddr_sz) {
-        ddr_staging_needed = p->layer_sz;  /* single buffer fallback */
-    }
-    int ddr_embed_max = (int)p->ddr_sz - ddr_staging_needed;
-    if (ddr_embed_max < 0) ddr_embed_max = 0;
+    /* --- Decide embedding split: DDR only.
+     *   ION is 100% for layer weights (3+3 double-buffer pipeline).
+     *   Embed rows beyond DDR are streamed from SD via embed_fd. */
+    int ddr_embed_max = (int)p->ddr_sz;
     p->embed_ddr_bytes = p->embed_total;
     if (p->embed_ddr_bytes > ddr_embed_max) p->embed_ddr_bytes = ddr_embed_max;
-    p->embed_ion_bytes = p->embed_total - p->embed_ddr_bytes;
-    /* Cap ION embed portion to ION_POOL_SZ (must leave room for at least
-     * 2 init-layer slots).  Embed rows beyond DDR+ION are streamed from SD. */
-    int ion_reserve = p->layer_sz * 2;  /* at least 2 init layer slots */
-    int ion_embed_max = (int)ION_POOL_SZ - ion_reserve;
-    if (p->embed_ion_bytes > ion_embed_max) {
-        p->embed_ion_bytes = ion_embed_max;
-        /* Adjust total: everything beyond DDR+ION is SD-only */
-    }
 
-    /* --- ION layer slots: after embedding portion --- */
-    p->ion_layer_off = p->embed_ion_bytes;
-    int ion_remain = ION_POOL_SZ - p->ion_layer_off;
-    p->ion_n_slots = ion_remain / p->layer_sz;
+    /* --- ION layer slots: entire ION for layer weights --- */
+    p->ion_layer_off = 0;
+    p->kv_bytes = 0;
+    p->kv_start = ION_POOL_SZ;
+    p->ion_free = ION_POOL_SZ;  /* full ION available until KV is allocated */
+    p->ion_n_slots = p->ion_free / p->layer_sz;
     if (p->ion_n_slots > ION_MAX_SLOTS) p->ion_n_slots = ION_MAX_SLOTS;
-
-    /* --- DDR overflow: entire DDR available after embedding lookup discarded --- */
-    p->ddr_max_overflow = p->ddr_sz / p->layer_sz;
-    if (p->ddr_max_overflow > DDR_MAX_OVERFLOW) p->ddr_max_overflow = DDR_MAX_OVERFLOW;
-    p->batch_target = p->ion_n_slots + p->ddr_max_overflow;
 
     /* --- Try to open mailbox to secondary core --- */
     p->use_mbox = (mbox_open() == 0);
     if (p->use_mbox) {
         fprintf(stderr, "[pool] mbox OK (secondary core available)\n");
     } else {
-        fprintf(stderr, "[pool] mbox not available — fallback to local memcpy\n");
+        fprintf(stderr, "[pool] mbox not available — CPU-only fallback\n");
     }
 
-    /* --- Resolve DDR buffer phys addrs via /proc/self/pagemap --- */
-    p->ddr_buf_pa[0] = 0;
-    p->ddr_buf_pa[1] = 0;
-    p->ddr_pa_done = 1;
-    if (!p->ddr_pa_done) {} /* suppress unused warning */
-    /* pagemap not available on this kernel; DDR→ION always uses local memcpy.
-     * LM Head transpose uses ION→ION addresses (known) and can use mbox. */
+    /* DDR holds embed cache; ION stages weights directly (no DDR staging needed) */
+    if (p->ddr_sz < DDR_POOL_MIN) {
+        fprintf(stderr, "  POOL: DDR too small (%d MB < min %d MB)\n",
+                p->ddr_sz/1024/1024, DDR_POOL_MIN/1024/1024);
+        pool_free(p, rt); return -1;
+    }
+
+    /* Open embed fd early so inode stays cached */
+    {
+        char epath[256];
+        snprintf(epath, sizeof(epath), "%s/embed.i8", weight_dir);
+        p->embed_fd = open(epath, O_RDONLY);
+    }
+    /* fd may be -1 if file missing; pool_get_embed_row will fallback */
 
     fprintf(stderr, "[pool] ION pa=0x%llx va=%p sz=%d MB\n",
             (unsigned long long)p->ion_paddr, p->ion_vaddr, ION_POOL_SZ/1024/1024);
-    fprintf(stderr, "[pool] DDR va=%p sz=%d MB (tried %d MB)\n",
-            p->ddr_base, p->ddr_sz/1024/1024, DDR_POOL_TRY/1024/1024);
-    fprintf(stderr, "[pool] Embed: %d KB total, %d KB DDR + %d KB ION\n",
-            p->embed_total/1024, p->embed_ddr_bytes/1024, p->embed_ion_bytes/1024);
-    fprintf(stderr, "[pool] ION slots: %d init / %d expanded, DDR overflow: %d, batch: %d\n",
-            p->ion_n_slots, ION_MAX_SLOTS, p->ddr_max_overflow, p->batch_target);
-    fprintf(stderr, "[pool] DDR staging: %d MB (%d buffers x %.1f MB each)\n",
-            ddr_staging_needed/1024/1024, ddr_staging_needed/p->layer_sz,
-            p->layer_sz/1024.0/1024.0);
+    fprintf(stderr, "[pool] DDR va=%p sz=%d MB (embed cache)\n",
+            p->ddr_base, p->ddr_sz/1024/1024);
+    fprintf(stderr, "[pool] Embed: %d KB total, %d KB DDR + SD\n",
+            p->embed_total/1024, p->embed_ddr_bytes/1024);
+    fprintf(stderr, "[pool] ION slots: %d (pipeline mode set after KV alloc)\n",
+            p->ion_n_slots);
+
+    /* Allocate static work buffers for sm_layer_forward (~275 KB total).
+     * These are reused across all 30 layers and all steps, eliminating
+     * 15-20 malloc/free calls per layer invocation. */
+    p->work_f32 = (uint8_t *)malloc(WORK_F32_SZ);
+    p->work_i8  = (uint8_t *)malloc(WORK_I8_SZ);
+    if (!p->work_f32 || !p->work_i8) {
+        fprintf(stderr, "  POOL: work buffer alloc failed\n");
+        free(p->work_f32); free(p->work_i8);
+        pool_free(p, rt); return -1;
+    }
+    fprintf(stderr, "[pool] work buffers: f32=%d KB, i8=%d KB\n",
+            WORK_F32_SZ/1024, WORK_I8_SZ/1024);
+
     return 0;
+}
+
+/* ---- KV cache allocation in ION (implementation, after pool_t defined) ---- */
+static sm_kv_cache_t *sm_kv_alloc_ion(struct pool_t *pool, int max_seq, int dkv, int n_layers, CVI_RT_HANDLE rt) {
+    sm_kv_cache_t *kv = (sm_kv_cache_t*)calloc(1, sizeof(sm_kv_cache_t));
+    if (!kv) return NULL;
+    (void)rt;
+
+    int per_layer = max_seq * dkv * sizeof(float);
+    int per_layer_aligned = (per_layer + 255) & ~255;
+    int kv_total = n_layers * 2 * per_layer_aligned;
+    int kv_start = ION_POOL_SZ - kv_total;
+
+    if (kv_start < 0) {
+        fprintf(stderr, "  KV: too large for ION (%d KB > %d MB)\n",
+                kv_total/1024, ION_POOL_SZ/1024/1024);
+        free(kv); return NULL;
+    }
+
+    uint8_t *kv_base = pool->ion_vaddr + kv_start;
+    memset(kv_base, 0, kv_total);
+    for (int l = 0; l < n_layers; l++) {
+        kv->K[l] = (float *)(kv_base + l * 2 * per_layer_aligned);
+        kv->V[l] = (float *)(kv_base + (l * 2 + 1) * per_layer_aligned);
+    }
+
+    pool->kv_bytes  = kv_total;
+    pool->kv_start  = kv_start;
+    pool->ion_free  = kv_start;
+
+    fprintf(stderr, "[kv] ION: %d KB at off=%d (max_seq=%d), ION free=%d KB\n",
+            kv_total/1024, kv_start, max_seq, pool->ion_free/1024);
+    return kv;
 }
 
 /* ---- Load embedding + first 3 layers into pool ---- */
@@ -974,31 +1238,8 @@ static int pool_load_embed_and_init_layers(pool_t *p) {
         close(fd);
         fprintf(stderr, "  Embed DDR done.\n");
     }
-    /* ION portion: bytes [embed_ddr_bytes, embed_total).
-     * Re-open to seek past DDR portion + release DDR page cache. */
-    if (p->embed_ion_bytes > 0) {
-        snprintf(path, sizeof(path), "%s/embed.i8", p->weight_dir);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) { fprintf(stderr, "  POOL: cannot reopen embed.i8\n"); return -1; }
-        lseek(fd, p->embed_ddr_bytes, SEEK_SET);
-        fprintf(stderr, "  Loading embed ION: %d KB...\n", p->embed_ion_bytes/1024);
-        int remain = p->embed_ion_bytes;
-        uint8_t *dst = p->ion_vaddr;
-        while (remain > 0) {
-            int n = (remain < 262144) ? remain : 262144;
-            if (read(fd, buf, n) != n) {
-                fprintf(stderr, "  POOL: embed ION read fail at %d/%d\n",
-                        p->embed_ion_bytes - remain, p->embed_ion_bytes);
-                close(fd); return -1;
-            }
-            memcpy(dst, buf, n);
-            dst += n; remain -= n;
-        }
-        close(fd);
-        fprintf(stderr, "  Embed ION done.\n");
-    }
-    fprintf(stderr, "  Embed loaded: %.0f ms (%d KB DDR + %d KB ION)\n",
-            (TICK()-ts)/1000.0, p->embed_ddr_bytes/1024, p->embed_ion_bytes/1024);
+    fprintf(stderr, "  Embed loaded: %.0f ms (%d KB DDR)\n",
+            (TICK()-ts)/1000.0, p->embed_ddr_bytes/1024);
 
     /* Load first 3 layers into ION slots — reuse static staging buffer */
     ts = TICK();
@@ -1009,7 +1250,7 @@ static int pool_load_embed_and_init_layers(pool_t *p) {
         int fd = open(path, O_RDONLY);
         if (fd < 0) { fprintf(stderr, "  POOL: open layer%d fail\n", i); return -1; }
         int remain = p->layer_sz;
-        uint8_t *dst = p->ion_vaddr + p->ion_layer_off + i * p->layer_sz;
+        uint8_t *dst = p->ion_vaddr + i * p->layer_sz;
         while (remain > 0) {
             int n = (remain < 262144) ? remain : 262144;
             if (read(fd, buf, n) != n) {
@@ -1031,141 +1272,121 @@ static int pool_load_embed_and_init_layers(pool_t *p) {
  *   ION+DDR repurposed for layer weight slots + staging buffers.
  *   Preserves ION embed in place to accelerate LM Head chunk reads. ---- */
 static void pool_ion_expand_for_batch(pool_t *p) {
-    /* Keep ION embed valid — slot count is what fits AFTER embed. */
-    p->ion_layer_off = p->embed_ion_bytes;
-    int ion_avail = ION_POOL_SZ - p->ion_layer_off;
-    p->ion_n_slots = ion_avail / p->layer_sz;
-    if (p->ion_n_slots > ION_MAX_SLOTS) p->ion_n_slots = ION_MAX_SLOTS;
-    p->ddr_max_overflow = p->ddr_sz / p->layer_sz;
-    if (p->ddr_max_overflow > DDR_MAX_OVERFLOW) p->ddr_max_overflow = DDR_MAX_OVERFLOW;
-    p->batch_target = p->ion_n_slots + p->ddr_max_overflow;
+    if (p->ion_expanded) {
+        fprintf(stderr, "  POOL reuse: %d ION weight slots, %d+%d pipe, embed hit=%.0f%%\n",
+                p->ion_n_slots, p->pipeline_mode, p->pipeline_mode,
+                100.0*(p->embed_ddr_bytes+p->embed_ion_bytes)/p->embed_total);
+        return;
+    }
+
+    /* Weight slots + embed cache fit in ion_free (space below KV cache). */
+    int weight_slots = p->pipeline_mode * 2;
+    p->ion_layer_off = 0;
+    p->ion_n_slots = weight_slots;
     for (int i = 0; i < p->ion_n_slots; i++) p->ion_slot_layer[i] = -1;
 
-    /* Repurpose DDR for dual staging buffers:
-     *   ddr_buf[0] = ddr_base[0 .. layer_sz-1]
-     *   ddr_buf[1] = ddr_base[layer_sz .. 2*layer_sz-1]
-     * DDR embed is invalidated but ION embed stays. */
-    p->ddr_buf[0] = p->ddr_base;
-    p->ddr_buf[1] = p->ddr_base + p->layer_sz;
-    p->ddr_buf_loaded[0] = 0;
-    p->ddr_buf_loaded[1] = 0;
-    p->ddr_cur_buf = 0;
-    p->embed_ddr_bytes = 0;  /* DDR embed overwritten by staging */
+    /* First-time setup: keep DDR embed + load ION embed cache for rows beyond DDR. */
+    int cb = p->D * 1024;
+    p->embed_ddr_bytes = (p->embed_ddr_bytes / cb) * cb;  /* keep DDR, don't release */
 
-    if (p->ddr_sz < p->layer_sz * 2) {
-        p->ddr_buf[1] = NULL;
-        fprintf(stderr, "  POOL: single-buffer staging (DDR %d MB < 2*layer_sz %d MB)\n",
-                p->ddr_sz/1024/1024, p->layer_sz*2/1024/1024);
+    p->embed_ion_offset = weight_slots * p->layer_sz;
+    int embed_space = p->ion_free - p->embed_ion_offset;
+    p->embed_ion_bytes = p->embed_total - p->embed_ddr_bytes;
+    if (p->embed_ion_bytes > embed_space) p->embed_ion_bytes = embed_space;
+    p->embed_ion_bytes = (p->embed_ion_bytes / cb) * cb;
+    /* DDR stays alive — embed_ddr_bytes preserved, not zeroed */
+
+    if (p->embed_ion_bytes > 0 && p->embed_fd >= 0) {
+        uint8_t *dst = p->ion_vaddr + p->embed_ion_offset;
+        int remain = p->embed_ion_bytes;
+        lseek(p->embed_fd, p->embed_ddr_bytes, SEEK_SET);  /* start where DDR ends */
+        while (remain > 0) {
+            int n = (remain < 262144) ? remain : 262144;
+            if (read(p->embed_fd, io_buf, n) != n) break;
+            memcpy(dst, io_buf, n);
+            dst += n; remain -= n;
+        }
+        CVI_RT_MemFlush(p->rt_handle, p->ion_mem);
     }
-    fprintf(stderr, "  POOL expand: %d ION slots (offset=%d KB), embed_ion=%d KB kept\n",
-            p->ion_n_slots, p->ion_layer_off/1024, p->embed_ion_bytes/1024);
+    p->ion_expanded = 1;
+
+    fprintf(stderr, "  POOL expand: %d+%d pipe, %dW slots + embed DDR=%dKB ION=%dKB (hit=%.0f%%, KV=%dKB in ION)\n",
+            p->pipeline_mode, p->pipeline_mode, p->ion_n_slots,
+            p->embed_ddr_bytes/1024, p->embed_ion_bytes/1024,
+            100.0*(p->embed_ddr_bytes+p->embed_ion_bytes)/p->embed_total,
+            p->kv_bytes/1024);
 }
 
-/* ---- Look up token embedding: DDR portion from memory (permanent),
- *   ION portion from embed fd (streamed to avoid 28 MB reload). ---- */
+/* ---- Dynamic pipeline downgrade as KV cache grows in ION.
+ *   KV cache sits at top of ION.  Weight slots + embed cache share
+ *   the remaining space below.  As max_seq (and thus KV) grows,
+ *   fewer weight slots fit → pipeline mode drops naturally.
+ *
+ *   This is set ONCE at init based on ION free space after KV alloc,
+ *   NOT dynamically during decode (KV space is pre-allocated).
+ *
+ *   Mode 3 (3+3): need 6 weight slots (20.3MB) + min 2MB embed → ion_free >= 22.3MB
+ *   Mode 2 (2+2): need 4 weight slots (13.5MB) + min 2MB embed → ion_free >= 15.5MB
+ *   Mode 1 (1+1): need 2 weight slots (6.8MB)  + min 2MB embed → ion_free >= 8.8MB ---- */
+static int pool_calc_pipeline_mode(int ion_free, int layer_sz) {
+    int min_embed = 2 * 1024 * 1024;  /* reserve at least 2MB for embed cache */
+    int slots = (ion_free - min_embed) / layer_sz;
+    if (slots < 0) slots = 0;
+
+    /* Need even number of slots for double-buffering */
+    int mode;
+    if      (slots >= 6)  mode = 3;
+    else if (slots >= 4)  mode = 2;
+    else                  mode = 1;
+
+    int weight_slots = mode * 2;
+    int embed_bytes = ion_free - weight_slots * layer_sz;
+
+    fprintf(stderr, "  [pipeline] ion_free=%dKB → %d+%d pipe, %dW slots, embed=%dKB DDR=%dKB\n",
+            ion_free/1024, mode, mode, weight_slots, embed_bytes/1024,
+            embed_bytes > 0 ? embed_bytes/1024 : 0);
+    return mode;
+}
+static int pool_reconfig_for_kv(pool_t *p, int kv_len) {
+    /* Pipeline mode is determined at init from ion_free (KV in ION).
+     * No dynamic change needed — KV space is pre-allocated.
+     * This stub exists for the call site in decode loop. */
+    (void)kv_len;
+    return p->pipeline_mode;
+}
+
+/* ---- Look up token embedding: DDR > ION > SD (embed_fd) ---- */
 static void pool_get_embed_row(pool_t *p, int token_id, uint8_t *row_out) {
     int off = token_id * p->D;
     if (off < p->embed_ddr_bytes) {
         memcpy(row_out, p->ddr_base + off, p->D);
-    } else {
-        /* ION-range token: read from embed fd (seek + read 576 bytes) */
-        if (p->embed_fd >= 0) {
-            lseek(p->embed_fd, (off_t)off, SEEK_SET);
-            int n = read(p->embed_fd, row_out, p->D);
+        return;
+    }
+    if (p->embed_ion_bytes > 0 &&
+        off >= p->embed_ddr_bytes &&
+        off < p->embed_ddr_bytes + p->embed_ion_bytes) {
+        memcpy(row_out, p->ion_vaddr + p->embed_ion_offset + (off - p->embed_ddr_bytes), p->D);
+        return;
+    }
+    /* SD fallback: try cached fd first, re-open if needed */
+    if (p->embed_fd >= 0) {
+        lseek(p->embed_fd, (off_t)off, SEEK_SET);
+        int n = read(p->embed_fd, row_out, p->D);
+        if (n == p->D) return;
+    }
+    /* Last resort: open fresh fd (cached fd may have failed) */
+    {
+        char epath[256];
+        snprintf(epath, sizeof(epath), "%s/embed.i8", p->weight_dir);
+        int fd = open(epath, O_RDONLY);
+        if (fd >= 0) {
+            lseek(fd, (off_t)off, SEEK_SET);
+            int n = read(fd, row_out, p->D);
+            close(fd);
             if (n == p->D) return;
         }
-        memset(row_out, 0, p->D);  /* fallback: zero row */
     }
-}
-
-/* ---- Load a batch of layers: fill ION slots + DDR overflow ---- */
-static int pool_load_batch(pool_t *p, int batch_start, int batch_n) {
-    char path[256];
-    int n_ion = (batch_n < p->ion_n_slots) ? batch_n : p->ion_n_slots;
-    int n_ddr = batch_n - n_ion;
-    if (n_ddr > p->ddr_max_overflow) {
-        fprintf(stderr, "  POOL: batch too large (%d > ION%d+DDR%d)\n",
-                batch_n, p->ion_n_slots, p->ddr_max_overflow);
-        return -1;
-    }
-
-    for (int i = 0; i < p->ion_n_slots; i++) p->ion_slot_layer[i] = -1;
-    p->ddr_n_layers = 0;
-
-    uint8_t *buf = io_buf;
-
-    double ts = TICK();
-    for (int i = 0; i < n_ion; i++) {
-        int l = batch_start + i;
-        snprintf(path, sizeof(path), "%s/layer%d.bin", p->weight_dir, l);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) { fprintf(stderr, "  POOL: open layer%d fail\n", l); return -1; }
-        int remain = p->layer_sz;
-        uint8_t *dst = p->ion_vaddr + p->ion_layer_off + i * p->layer_sz;
-        while (remain > 0) {
-            int n = (remain < 262144) ? remain : 262144;
-            if (read(fd, buf, n) != n) {
-                fprintf(stderr, "  POOL: layer%d ION read fail\n", l);
-                close(fd); return -1;
-            }
-            memcpy(dst, buf, n);
-            dst += n; remain -= n;
-        }
-        close(fd);
-        p->ion_slot_layer[i] = l;
-    }
-    for (int i = 0; i < n_ddr; i++) {
-        int l = batch_start + n_ion + i;
-        snprintf(path, sizeof(path), "%s/layer%d.bin", p->weight_dir, l);
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) { fprintf(stderr, "  POOL: open layer%d DDR fail\n", l); return -1; }
-        int remain = p->layer_sz;
-        uint8_t *dst = p->ddr_base + i * p->layer_sz;
-        while (remain > 0) {
-            int n = (remain < 262144) ? remain : 262144;
-            if (read(fd, buf, n) != n) {
-                fprintf(stderr, "  POOL: layer%d DDR read fail\n", l);
-                close(fd); return -1;
-            }
-            memcpy(dst, buf, n);
-            dst += n; remain -= n;
-        }
-        close(fd);
-        p->ddr_layer_ids[i] = l;
-    }
-    p->ddr_n_layers = n_ddr;
-    p->batch_start = batch_start;
-    p->batch_end = batch_start + batch_n;
-
-    fprintf(stderr, "  Batch %d-%d: %d ION + %d DDR loaded, %.0f ms\n",
-            batch_start, batch_start+batch_n-1, n_ion, n_ddr, (TICK()-ts)/1000.0);
-    return 0;
-}
-
-/* ---- Get layer weight ptr.
- *   ION layers (offset < ion_n_slots): direct pointer.
- *   DDR overflow: memcpy into recycled ION slot (freed by earlier layer). ---- */
-static void pool_get_layer(pool_t *p, int layer_id, sm_layer_w_t *w) {
-    int batch_off = layer_id - p->batch_start;
-    if (batch_off < p->ion_n_slots) {
-        /* Direct ION access */
-        uint8_t *base = p->ion_vaddr + p->ion_layer_off + batch_off * p->layer_sz;
-        sm_setup_ptrs(w, base, p->D, p->dkv, p->F);
-    } else {
-        /* DDR overflow → recycle into ION slot */
-        int ddr_idx = batch_off - p->ion_n_slots;
-
-        /* Find a free ION slot. Earlier layers in this batch have already
-         * finished computing, so the first `ddr_idx` ION slots are free. */
-        int ion_slot = ddr_idx;
-        if (ion_slot >= p->ion_n_slots) ion_slot = p->ion_n_slots - 1;
-
-        uint8_t *src = p->ddr_base + ddr_idx * p->layer_sz;
-        uint8_t *dst = p->ion_vaddr + p->ion_layer_off + ion_slot * p->layer_sz;
-        memcpy(dst, src, p->layer_sz);
-        p->ion_slot_layer[ion_slot] = layer_id;
-        sm_setup_ptrs(w, dst, p->D, p->dkv, p->F);
-    }
+    memset(row_out, 0, p->D);
 }
 
 /* ---- LM Head: stream an embedding chunk from SD, transpose to column-major.
@@ -1216,177 +1437,180 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
     const sm_cfg_t *c, const char *weight_dir,
     const int *token_ids, int n_tokens, int kv_start,
     sm_kv_cache_t *kv, float *logits_out,
-    pool_t *pool, float *rope_cos, float *rope_sin, sm_timing_t *t)
+    pool_t *pool, float *rope_cos, float *rope_sin, sm_timing_t *t,
+    int need_lm_head)
 {
     int D = c->D, V = c->V, L = c->n_layers;
     double ts;
 
-    /* ---- Open embed.i8 for streaming DDR-range + LM Head reads ---- */
-    {
-        char epath[256];
-        snprintf(epath, sizeof(epath), "%s/embed.i8", pool->weight_dir);
-        pool->embed_fd = open(epath, O_RDONLY);
-        /* fd may be -1; pool_get_embed_row will fallback to zeros for ION-range */
-    }
-
-    /* ---- Embedding: from pool (DDR permanent + ION via fd streaming) ---- */
-    //fprintf(stderr, "  [dbg]embed start, n_tokens=%d, D=%d\n", n_tokens, D);
+    /* ---- Embedding: from pool (ION + DDR, opened in pool_init) ---- */
     ts = TICK();
     float *x = (float *)malloc(n_tokens * D * sizeof(float));
     if (!x) { return -1; }
-    //fprintf(stderr, "  [dbg]x=%p\n", (void*)x);
-    int8_t row_i8[576];  /* D=576 fits on stack */
+    int8_t row_i8[576];
     for (int i = 0; i < n_tokens; i++) {
         int tid = token_ids[i];
         if (tid < 0 || tid >= V) tid = 0;
         pool_get_embed_row(pool, tid, (uint8_t *)row_i8);
-        dequantize_f32(x + i * D, row_i8, D, EMBED_SCALE, 0);
+        dequantize_f32(x + i * D, row_i8, D, g_embed_scales ? g_embed_scales[tid] : EMBED_SCALE, 0);
     }
-    //fprintf(stderr, "  [dbg]embed done\n");
     t->t_embed += TICK() - ts;
 
     int kv_len = kv_start + n_tokens;
     sm_layer_w_t layer_buf; memset(&layer_buf, 0, sizeof(layer_buf));
 
-    /* Always reload ALL layers from SD each forward pass.
-     * Init-layer preloading is only valid for the very first call;
-     * after expand+batch, ION slots are recycled and init data is gone. */
-    int cur_layer = 0;
-    int n_init = 0;
-
-    /* Init layers done (none after first pass), embedding ION portion no longer needed. */
-    //fprintf(stderr, "  [dbg]before expand_for_batch\n");
+    /* Repurpose ION for layer slots after first call */
     pool_ion_expand_for_batch(pool);
-    //fprintf(stderr, "  [dbg]expand done, ion_n_slots=%d, layer_sz=%d\n", pool->ion_n_slots, pool->layer_sz);
 
-    /* ---- Dual-buffer pipelined layer loading.
-     *   DDR→ION uses local memcpy (pagemap unavailable for phys addr).
-     *   With dual buffers: SD read next layer while DDR→ION copies current.
-     *   Single buffer fallback: serial SD→DDR→ION. ---- */
     int ion_n_slots = pool->ion_n_slots;
-    int ddr_has_dual = (pool->ddr_buf[1] != NULL);
-    uint64_t ion_pa = pool->ion_paddr;
-    uint64_t ddr_pa_buf0 = pool->ddr_buf_pa[0];
-    uint64_t ddr_pa_buf1 = pool->ddr_buf_pa[1];
+    uint8_t *ion_va = pool->ion_vaddr;
+    int layer_sz = pool->layer_sz;
 
-    /* Helper: read one layer from SD into a DDR buffer */
-    #define SD_READ_LAYER(lid, dst) do { \
-        char _path[256]; \
-        snprintf(_path, sizeof(_path), "%s/layer%d.bin", pool->weight_dir, lid); \
-        int _fd = open(_path, O_RDONLY); \
-        if (_fd < 0) { free(x); return -1; } \
-        int _remain = pool->layer_sz; \
-        uint8_t *_d = dst; \
-        while (_remain > 0) { \
-            int _n = (_remain < 262144) ? _remain : 262144; \
-            int _rn = read(_fd, io_buf, _n); \
-            if (_rn != _n) { close(_fd); free(x); return -1; } \
-            memcpy(_d, io_buf, _n); _d += _n; _remain -= _n; \
-        } \
-        close(_fd); \
-    } while(0)
+    /* ================================================================
+     *  ION 3+3 DOUBLE-BUFFER BATCH PIPELINE
+     *
+     *  ION split into 2 banks (3 slots each = 10.1MB/bank):
+     *    Bank A (slots 0-2): active — TPU computes from these
+     *    Bank B (slots 3-5): prefetch — SD reads next batch here
+     *
+     *  Pipeline:  compute Bank A | SD read → Bank B  (overlapped)
+     *             swap banks
+     *             compute Bank B | SD read → Bank A  (overlapped)
+     *
+     *  Key: SD reads directly into ION — no DDR staging, no memcpy.
+     *  Falls back to serial mode if ION slots < 6.
+     * ================================================================ */
+    int batch_slots = pool->pipeline_mode;  /* 3, 2, or 1 */
+    int bank_a = 0, bank_b = batch_slots;
+    int use_pipeline = (ion_n_slots >= 2 * batch_slots);
 
-    /* Helper: copy DDR buffer -> ION slot and flush cache */
-    #define DDR_TO_ION(ddr_va, ion_off) do { \
-        uint8_t *_ion_dst = pool->ion_vaddr + pool->ion_layer_off + ion_off; \
-        memcpy(_ion_dst, ddr_va, pool->layer_sz); \
-        CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem); \
-    } while(0)
-
-    /* ---- Layer 0: no pipeline, load directly ---- */
-    int prev_buf = 0;
-    SD_READ_LAYER(0, pool->ddr_buf[0]);
-    DDR_TO_ION(pool->ddr_buf[0], 0);
-    pool->ion_slot_layer[0] = 0;
-
-    {
-        uint8_t *base = pool->ion_vaddr + pool->ion_layer_off;
-        sm_setup_ptrs(&layer_buf, base, pool->D, pool->dkv, pool->F);
-        double lt[14] = {0};
-        int rc = sm_layer_forward(ctx, cvk, nm, c, &layer_buf,
-                                  x, n_tokens, kv_start, kv_len,
-                                  kv, 0, rope_cos, rope_sin, lt);
-        if (rc) { free(x); return rc; }
-        t->t_rms_attn += lt[0];  t->t_q      += lt[1];
-        t->t_rope     += lt[4];  t->t_kv     += lt[5];
-        t->t_scores   += lt[6];  t->t_softmax+= lt[7];
-        t->t_attn     += lt[8];  t->t_wo     += lt[9];
-        t->t_rms_ffn  += lt[10]; t->t_ffn_up += lt[11];
-        t->t_ffn_down += lt[13];
-    }
-    cur_layer = 1;
-
-    /* Pre-read layer 1 for pipeline start.
-     * Dual-buffer: layer 1 goes to buf[1] (buf[0] holds layer 0 data).
-     * Single-buffer: layer 1 goes to buf[0] (overwrites stale layer 0 data). */
-    if (L > 1) {
-        int first_buf = ddr_has_dual ? 1 : 0;
-        SD_READ_LAYER(1, pool->ddr_buf[first_buf]);
-        pool->ddr_buf_loaded[first_buf] = 1;
-        if (!ddr_has_dual) prev_buf = 0;  /* single-buffer: buf[0] has layer 1 */
+    /* pf_job_t for direct SD→ION reads (3 threads, one per batch slot) */
+    pf_job_t jobs[batch_slots];
+    for (int j = 0; j < batch_slots; j++) {
+        memset(&jobs[j], 0, sizeof(jobs[j]));
+        pthread_mutex_init(&jobs[j].lock, NULL);
+        pthread_cond_init(&jobs[j].cond, NULL);
     }
 
-    /* ---- Layers 1..L-1: pipelined ---- */
-    while (cur_layer < L) {
-        int cur_buf = ddr_has_dual ? (1 - prev_buf) : 0;  /* pre-filled buf */
-        int next_buf = prev_buf;  /* prev layer's buf, now free for next SD read */
-        int ion_slot = cur_layer % ion_n_slots;
-        int next_layer = cur_layer + 1;
+    if (use_pipeline) {
+        fprintf(stderr, "  [pipeline] ION %d+%d batch: compute Bank A | SD→Bank B\n",
+                batch_slots, batch_slots);
 
+        /* ---- Load first batch (layers 0-2) into Bank A (sync) ---- */
         ts = TICK();
-
-        /* Dual-buffer: kick off SD read of NEXT layer while we DDR→ION current.
-         * The SD read goes into next_buf (the buffer used for the PREVIOUS layer,
-         * which is now free). This overlaps SD I/O with DDR→ION memcpy.
-         * Single-buffer: SD read happens AFTER DDR→ION (below). */
-        if (ddr_has_dual && next_layer < L) {
-            SD_READ_LAYER(next_layer, pool->ddr_buf[next_buf]);
-            pool->ddr_buf_loaded[next_buf] = 1;
-        }
-
-        /* DDR → ION for current layer.
-         * Prefer secondary core async copy; fall back to local memcpy. */
-        int use_async = (pool->use_mbox && ddr_pa_buf0 > 0);
-        int mbox_slot = cur_layer % 4;  /* rotate through 4 desc slots */
-        uint64_t ddr_pa = (cur_buf == 0) ? ddr_pa_buf0 : ddr_pa_buf1;
-        if (use_async && ddr_pa > 0) {
-            uint64_t ion_off_pa = ion_pa + pool->ion_layer_off + ion_slot * pool->layer_sz;
-            if (mbox_ddr_to_ion_async(ctx, mbox_slot, ddr_pa, ion_off_pa,
-                                       pool->layer_sz) == 0) {
-                uint8_t *nm_ptr = ctx->neuron_vaddr;
-                uint64_t nm_pa = CVI_RT_MemGetPAddr(ctx->neuron_mem);
-                mha_dma_desc_t *desc = mbox_desc_ptr(nm_ptr, nm_pa, mbox_slot);
-                if (mbox_poll_desc(ctx, desc, MBOX_TIMEOUT_US) != 0) {
-                    fprintf(stderr, "  MBOX: layer %d DDR→ION timeout, local fallback\n",
-                            cur_layer);
-                    DDR_TO_ION(pool->ddr_buf[cur_buf],
-                               ion_slot * pool->layer_sz);
-                }
-            } else {
-                DDR_TO_ION(pool->ddr_buf[cur_buf],
-                           ion_slot * pool->layer_sz);
+        for (int i = 0; i < batch_slots; i++) {
+            char lpath[256];
+            snprintf(lpath, sizeof(lpath), "%s/layer%d.bin", weight_dir, i);
+            int fd = open(lpath, O_RDONLY);
+            if (fd < 0) { use_pipeline = 0; break; }
+            uint8_t *dst = ion_va + (bank_a + i) * layer_sz;
+            int remain = layer_sz;
+            while (remain > 0) {
+                int n = (remain < 262144) ? remain : 262144;
+                if (read(fd, io_buf, n) != n) { close(fd); use_pipeline = 0; break; }
+                memcpy(dst, io_buf, n); dst += n; remain -= n;
             }
-        } else {
-            DDR_TO_ION(pool->ddr_buf[cur_buf],
-                       ion_slot * pool->layer_sz);
+            close(fd);
+            if (!use_pipeline) break;
         }
-        pool->ion_slot_layer[ion_slot] = cur_layer;
-        t->t_weight_load += TICK() - ts;
+        if (use_pipeline) {
+            CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
+            t->t_weight_load += TICK() - ts;
 
-        /* Single buffer: SD read next layer after DDR→ION is done */
-        if (!ddr_has_dual && next_layer < L) {
-            SD_READ_LAYER(next_layer, pool->ddr_buf[0]);
+            /* Start prefetching second batch (layers 3-5) into Bank B */
+            for (int i = 0; i < batch_slots; i++) {
+                if (pf_start(&jobs[i], weight_dir, batch_slots + i,
+                             layer_sz, ion_va + (bank_b + i) * layer_sz) != 0) {
+                    use_pipeline = 0; break;
+                }
+            }
         }
 
-        /* TPU compute on current layer */
-        {
-            uint8_t *base = pool->ion_vaddr + pool->ion_layer_off + ion_slot * pool->layer_sz;
-            sm_setup_ptrs(&layer_buf, base, pool->D, pool->dkv, pool->F);
+        if (use_pipeline) {
 
+            for (int batch = 0; batch < (L + batch_slots - 1) / batch_slots; batch++) {
+                int batch_start = batch * batch_slots;
+                int is_last = (batch_start + batch_slots >= L);
+
+                /* ---- Compute active bank ---- */
+                for (int i = 0; i < batch_slots && (batch_start + i) < L; i++) {
+                    uint8_t *base = ion_va + (bank_a + i) * layer_sz;
+                    sm_setup_ptrs(&layer_buf, base, D, pool->dkv, pool->F);
+                    double lt[14] = {0};
+                    int rc = sm_layer_forward(ctx, cvk, nm, c, &layer_buf,
+                                              x, n_tokens, kv_start, kv_len,
+                                              kv, batch_start + i,
+                                              rope_cos, rope_sin, lt,
+                                              pool->work_f32, pool->work_i8);
+                    if (rc) {
+                        for (int j = 0; j < batch_slots; j++)
+                            pthread_mutex_destroy(&jobs[j].lock),
+                            pthread_cond_destroy(&jobs[j].cond);
+                        free(x); return rc;
+                    }
+                    t->t_rms_attn += lt[0];  t->t_q      += lt[1];
+                    t->t_rope     += lt[4];  t->t_kv     += lt[5];
+                    t->t_scores   += lt[6];  t->t_softmax+= lt[7];
+                    t->t_attn     += lt[8];  t->t_wo     += lt[9];
+                    t->t_rms_ffn  += lt[10]; t->t_ffn_up += lt[11];
+                    t->t_ffn_down += lt[13];
+                }
+
+                /* Last batch done — compute complete, break */
+                if (is_last) break;
+
+                /* ---- Wait for prefetch into Bank B ---- */
+                ts = TICK();
+                for (int i = 0; i < batch_slots; i++) {
+                    if (pf_wait(&jobs[i]) != 0) { use_pipeline = 0; break; }
+                }
+                if (!use_pipeline) break;
+                CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
+                t->t_weight_load += TICK() - ts;
+
+                /* ---- Swap banks ---- */
+                int tmp = bank_a; bank_a = bank_b; bank_b = tmp;
+
+                /* ---- Start prefetching next batch into (new) Bank B ---- */
+                int next_start = batch_start + 2 * batch_slots;
+                for (int i = 0; i < batch_slots && (next_start + i) < L; i++) {
+                    if (pf_start(&jobs[i], weight_dir, next_start + i,
+                                 layer_sz, ion_va + (bank_b + i) * layer_sz) != 0) {
+                        use_pipeline = 0; break;
+                    }
+                }
+            }
+
+        }
+    }
+
+    if (!use_pipeline) {
+fallback:
+        fprintf(stderr, "  [fallback] serial SD read + TPU (no pipeline)\n");
+        /* Fallback: single ION slot, serial SD read + TPU */
+        for (int i = 0; i < L; i++) {
+            ts = TICK();
+            char lpath[256];
+            snprintf(lpath, sizeof(lpath), "%s/layer%d.bin", weight_dir, i);
+            int fd = open(lpath, O_RDONLY);
+            if (fd < 0) { free(x); return -1; }
+            int remain = layer_sz;
+            uint8_t *dst = ion_va;
+            while (remain > 0) {
+                int n = (remain < 262144) ? remain : 262144;
+                if (read(fd, io_buf, n) != n) { close(fd); free(x); return -1; }
+                memcpy(dst, io_buf, n); dst += n; remain -= n;
+            }
+            close(fd);
+            CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
+            t->t_weight_load += TICK() - ts;
+
+            sm_setup_ptrs(&layer_buf, ion_va, D, pool->dkv, pool->F);
             double lt[14] = {0};
             int rc = sm_layer_forward(ctx, cvk, nm, c, &layer_buf,
                                       x, n_tokens, kv_start, kv_len,
-                                      kv, cur_layer, rope_cos, rope_sin, lt);
+                                      kv, i, rope_cos, rope_sin, lt,
+                                      pool->work_f32, pool->work_i8);
             if (rc) { free(x); return rc; }
             t->t_rms_attn += lt[0];  t->t_q      += lt[1];
             t->t_rope     += lt[4];  t->t_kv     += lt[5];
@@ -1395,16 +1619,17 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
             t->t_rms_ffn  += lt[10]; t->t_ffn_up += lt[11];
             t->t_ffn_down += lt[13];
         }
-        prev_buf = cur_buf;
-        cur_layer++;
     }
 
-    #undef SD_READ_LAYER
-    #undef DDR_TO_ION
+    for (int j = 0; j < batch_slots; j++) {
+        pthread_mutex_destroy(&jobs[j].lock);
+        pthread_cond_destroy(&jobs[j].cond);
+    }
 
-    /* ---- LM Head: stream embed chunks from SD, transpose via secondary core
-     *   (or CPU fallback).  Double-buffered in ION pool memory. ---- */
-    /* embed_fd was already opened at start of this function. */
+    /* ---- LM Head: stream embed chunks, transpose via mbox or CPU.
+     *   Double-buffered in ION pool memory.
+     *   Skipped for intermediate chunks in chunked prefill. ---- */
+    if (need_lm_head) {
     ts = TICK();
     float *final_normed = (float *)malloc(n_tokens * D * sizeof(float));
     float *final_rms = (float *)malloc(D * sizeof(float));
@@ -1422,11 +1647,15 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
     quantize_i8_sym(x_final_i8, final_normed, n_tokens * D, sc_final);
     free(final_normed);
 
-    int rshift_lm = matmul_rshift(D);
+    /* LM Head needs smaller rshift than QKV/FFN because the final
+     * hidden state has small INT8 values (~[-8,7] vs ~[-64,64] mid-network).
+     * rshift=17 (safe for worst-case 576*127*127=9.3M) would zero out
+     * nearly all dot products.  rshift=12 keeps typical dot products
+     * while allowing max ~9.3M/4096=2270 which is clipped to 127 but
+     * real dot products are far below that. */
+    int rshift_lm = matmul_rshift(D) - 5;  /* 17 → 12, keep precision without overflow */
+    if (rshift_lm < 10) rshift_lm = 10;
 
-    /* Double-buffer pipeline: while TPU computes chunk i, pre-read chunk i+1
-     * from SD (or use ION in-memory embed for cached tokens).
-     * Buffers: 4 regions in ION pool (2 src + 2 dst for double-buffering). */
     int lm_use_mbox = pool->use_mbox;
     int buf_sz = D * CHUNK;
     uint8_t *xpose_src[2];
@@ -1440,65 +1669,48 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
         xpose_dst_pa[b] = xpose_ion_pa + (2 + b) * buf_sz;
     }
 
-    /* Number of embed tokens already in ION memory */
-    int embed_ion_tokens = pool->embed_ion_bytes / D;
-
     int rc_lm, cur = 0;
     uint32_t lm_result_off = SM_S_I8_OFF;
+
+    /* Cache-aware embed chunk read: DDR > ION > SD.
+     * DDR covers [0, embed_ddr_bytes), ION covers
+     * [embed_ddr_bytes, embed_ddr_bytes+embed_ion_bytes).
+     * Cross-boundary or beyond-cache → SD fallback. */
+    int emb_ddr = pool->embed_ddr_bytes;
+    int emb_ion = pool->embed_ion_bytes;
+    int emb_ion_off = pool->embed_ion_offset;
+    #define LM_CACHE_READ(dst_va, file_off, len) do { \
+        off_t _off = (file_off); \
+        int   _len = (len); \
+        if (_off + _len <= emb_ddr) { \
+            memcpy((dst_va), pool->ddr_base + _off, _len); \
+        } else if (emb_ion > 0 && _off >= emb_ddr && \
+                   _off + _len <= emb_ddr + emb_ion) { \
+            memcpy((dst_va), pool->ion_vaddr + emb_ion_off + (_off - emb_ddr), _len); \
+        } else { \
+            lseek(pool->embed_fd, _off, SEEK_SET); \
+            read(pool->embed_fd, (dst_va), _len); \
+        } \
+    } while(0)
 
     /* Pre-load first chunk */
     {
         int v_start = 0;
         int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
-        int total = D * cur_v;
-        if (v_start < embed_ion_tokens) {
-            int mem_v = cur_v;
-            if (v_start + cur_v > embed_ion_tokens)
-                mem_v = embed_ion_tokens - v_start;
-            int mem_bytes = D * mem_v;
-            memcpy(xpose_src[cur], pool->ion_vaddr + v_start * D, mem_bytes);
-            if (mem_v < cur_v) {
-                off_t sd_off = (off_t)embed_ion_tokens * D;
-                int sd_bytes = D * (cur_v - mem_v);
-                lseek(pool->embed_fd, sd_off, SEEK_SET);
-                read(pool->embed_fd, xpose_src[cur] + mem_bytes, sd_bytes);
-            }
-        } else {
-            lseek(pool->embed_fd, (off_t)v_start * D, SEEK_SET);
-            read(pool->embed_fd, xpose_src[cur], total);
-        }
+        LM_CACHE_READ(xpose_src[cur], v_start * D, D * cur_v);
         CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
     }
 
     for (int v_start = 0; v_start < V; v_start += CHUNK) {
         int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
-        int nxt = 1 - cur;  /* next buffer index */
+        int nxt = 1 - cur;
         int nxt_v_start = v_start + CHUNK;
 
-        /* Start pre-reading next chunk from SD into nxt buffer */
         if (nxt_v_start < V) {
             int nxt_cur_v = (nxt_v_start + CHUNK <= V) ? CHUNK : V - nxt_v_start;
-            int total = D * nxt_cur_v;
-            if (nxt_v_start < embed_ion_tokens) {
-                int mem_v = nxt_cur_v;
-                if (nxt_v_start + nxt_cur_v > embed_ion_tokens)
-                    mem_v = embed_ion_tokens - nxt_v_start;
-                int mem_bytes = D * mem_v;
-                memcpy(xpose_src[nxt], pool->ion_vaddr + nxt_v_start * D, mem_bytes);
-                if (mem_v < nxt_cur_v) {
-                    off_t sd_off = (off_t)embed_ion_tokens * D;
-                    int sd_bytes = D * (nxt_cur_v - mem_v);
-                    lseek(pool->embed_fd, sd_off, SEEK_SET);
-                    read(pool->embed_fd, xpose_src[nxt] + mem_bytes, sd_bytes);
-                }
-            } else {
-                lseek(pool->embed_fd, (off_t)nxt_v_start * D, SEEK_SET);
-                read(pool->embed_fd, xpose_src[nxt], total);
-            }
-            /* Don't flush yet — will flush after transpose */
+            LM_CACHE_READ(xpose_src[nxt], nxt_v_start * D, D * nxt_cur_v);
         }
 
-        /* Transpose current chunk: secondary core (async) or CPU. */
         if (lm_use_mbox) {
             int mbox_slot = 0;
             int rc = mbox_embed_xpose_async(ctx, mbox_slot,
@@ -1514,17 +1726,18 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
                 lm_use_mbox = 0;
                 for (int j = 0; j < D; j++)
                     for (int v = 0; v < cur_v; v++)
-                        ((int8_t *)xpose_dst[cur])[j * cur_v + v] = (int8_t)xpose_src[cur][v * D + j];
+                        ((int8_t *)xpose_dst[cur])[j * cur_v + v] =
+                            (int8_t)xpose_src[cur][v * D + j];
                 CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
             }
         } else {
             for (int j = 0; j < D; j++)
                 for (int v = 0; v < cur_v; v++)
-                    ((int8_t *)xpose_dst[cur])[j * cur_v + v] = (int8_t)xpose_src[cur][v * D + j];
+                    ((int8_t *)xpose_dst[cur])[j * cur_v + v] =
+                        (int8_t)xpose_src[cur][v * D + j];
             CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
         }
 
-        /* TPU matmul */
         rc_lm = tpu_matmul_build(ctx, cvk, x_final_i8, n_tokens, D,
                                   xpose_dst[cur], cur_v,
                                   lm_result_off, SM_SCRATCH_OFF, rshift_lm);
@@ -1532,26 +1745,29 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
             CVI_RT_Submit(ctx->rt_khandle);
             CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem);
         }
-        if (rc_lm) { free(x_final_i8); free(logits_out); return -1; }
+        if (rc_lm) { free(x_final_i8); free(x); free(logits_out); return -1; }
 
-        /* Dequantize logits */
         int8_t *logits_i8 = (int8_t *)(nm + lm_result_off);
-        for (int t = 0; t < n_tokens; t++)
-            dequant_i8(logits_out + t * V + v_start,
-                       logits_i8 + t * cur_v, cur_v,
-                       EMBED_SCALE, sc_final, rshift_lm);
-
-        /* Flush next buffer's source data before transpose starts */
-        if (nxt_v_start < V) {
-            CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
+        for (int t = 0; t < n_tokens; t++) {
+            float *lt_out = logits_out + t * V + v_start;
+            int8_t *lt_i8  = logits_i8 + t * cur_v;
+            if (g_embed_scales) {
+                float s = sc_final * (1 << rshift_lm);
+                for (int v = 0; v < cur_v; v++)
+                    lt_out[v] = (float)lt_i8[v] * s * g_embed_scales[v_start + v];
+            } else {
+                dequant_i8(lt_out, lt_i8, cur_v,
+                           EMBED_SCALE, sc_final, rshift_lm);
+            }
         }
+
+        if (nxt_v_start < V)
+            CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
         cur = nxt;
     }
     free(x_final_i8);
     t->t_lm_head += TICK() - ts;
-
-    /* Close embed fd (opened at start of this function) */
-    if (pool->embed_fd >= 0) { close(pool->embed_fd); pool->embed_fd = -1; }
+    } /* need_lm_head */
 
     t->n_steps++;
     free(x);
@@ -1563,11 +1779,17 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
  * ================================================================ */
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <weight_dir> <token_ids.bin> <max_new_tokens>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <weight_dir> <token_ids.bin> <max_new_tokens> [force_mode:0=auto,1-3=force] [eos_id:0]\n", argv[0]);
+        fprintf(stderr, "  Output: one token_id per line on stdout, diagnostics on stderr\n");
         return 1;
     }
     const char *weight_dir = argv[1], *token_file = argv[2];
     int max_new = atoi(argv[3]);
+    int force_mode = (argc >= 5) ? atoi(argv[4]) : 0;
+    int eos_id    = (argc >= 6) ? atoi(argv[5]) : 0;
+    fprintf(stderr, "force_mode=%d (0=dynamic, 1-3=fixed), eos_id=%d\n", force_mode, eos_id);
+    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+      xorshift_state = (uint32_t)(ts.tv_sec ^ ts.tv_nsec); }
     setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "=== smollm2_pool_demo START ===\n");
 
@@ -1584,9 +1806,28 @@ int main(int argc, char **argv) {
     { char path[256]; snprintf(path,sizeof(path),"%s/scales.bin",weight_dir);
       g_scales=(float*)malloc(212*sizeof(float));
       if(read_file(path,g_scales,212*4)!=0){free(g_scales);g_scales=NULL;} }
+    /* Load per-row embed scales (generated by convert_smollm2.py --per-row) */
+    { char path[256]; snprintf(path,sizeof(path),"%s/embed_scales.f32",weight_dir);
+      g_embed_scales=(float*)malloc(V*sizeof(float));
+      if(read_file(path,g_embed_scales,V*4)!=0){free(g_embed_scales);g_embed_scales=NULL;} }
+    /* Load per-channel layer scales (generated by convert_smollm2.py with per-channel quant) */
+    { int ls_per_layer = D + c.d_qkv + c.d_qkv + D + F + F + D;
+      int ls_total = c.n_layers * ls_per_layer;
+      char path[256]; snprintf(path,sizeof(path),"%s/layer_scales.bin",weight_dir);
+      g_layer_scales=(float*)malloc(ls_total*sizeof(float));
+      if(read_file(path,g_layer_scales,ls_total*4)!=0){free(g_layer_scales);g_layer_scales=NULL;}
+      else fprintf(stderr,"  [layer_scales] %d scales (%d per layer, %d KB)\n",
+                   ls_total, ls_per_layer, ls_total*4/1024); }
 
     struct stat st; stat(token_file, &st);
-    int prompt_len=st.st_size/4; if(prompt_len>max_seq)prompt_len=max_seq;
+    int prompt_len=st.st_size/4;
+    int max_prompt = max_seq - max_new;
+    if (prompt_len > max_prompt) {
+        fprintf(stderr, "[Init] Truncating prompt %d -> %d (max_seq=%d, max_new=%d)\n",
+                prompt_len, max_prompt, max_seq, max_new);
+        prompt_len = max_prompt;
+    }
+    if (prompt_len < 1) prompt_len = 1;
     int *token_ids=(int*)malloc(prompt_len*sizeof(int));
     if(read_file(token_file,token_ids,prompt_len*4)!=0){fprintf(stderr,"ERROR: cannot read %s\n",token_file);return 1;}
     fprintf(stderr,"\n[Init] Prompt: %d tokens, max_new: %d\n",prompt_len,max_new);
@@ -1633,6 +1874,7 @@ int main(int argc, char **argv) {
     pool_t pool;
     if(pool_init(&pool,ctx.rt_handle,weight_dir,D,c.d_qkv,F)!=0){
         fprintf(stderr,"Pool init failed!\n");return 1;}
+    fprintf(stderr, "[swap] after pool_init: VmSwap=%d KB\n", get_swap_kb());
 
     /* Test MemFlush after pool_init */
     fprintf(stderr, "[dbg] Testing MemFlush after pool_init...\n");
@@ -1654,6 +1896,7 @@ int main(int argc, char **argv) {
 
     if(pool_load_embed_and_init_layers(&pool)!=0){
         fprintf(stderr,"Embed+init layers load failed!\n");return 1;}
+    fprintf(stderr, "[swap] after embed+init load: VmSwap=%d KB\n", get_swap_kb());
 
     /* Test MemFlush after embed load */
     fprintf(stderr, "[dbg] Testing MemFlush after embed load...\n");
@@ -1674,48 +1917,83 @@ int main(int argc, char **argv) {
         if(trc){fprintf(stderr,"Test4 FAIL!\n");return 1;}
     }
 
-    /* Shrink max_seq to actual needed length — saves ~2.5 MB KV cache DDR */
+    /* Shrink max_seq to actual needed length — saves KV cache space in ION */
     int kv_needed = prompt_len + max_new;
     if (c.max_seq > kv_needed) { c.max_seq = kv_needed; max_seq = kv_needed; }
-    fprintf(stderr, "[kv] max_seq=%d, ~%d KB\n", max_seq,
-            (int)(c.n_layers * 2 * max_seq * c.d_qkv * sizeof(float) / 1024));
 
     float *rope_cos=(float*)malloc(max_seq*(d/2)*sizeof(float));
     float *rope_sin=(float*)malloc(max_seq*(d/2)*sizeof(float));
     rope_precompute(max_seq,d,rope_cos,rope_sin);
-    sm_kv_cache_t *kv=sm_kv_alloc(ctx.rt_handle,&c);
-    if(!kv){fprintf(stderr,"KV cache alloc failed!\n");return 1;}
 
-    /* ---- Prefill (batch all tokens in one forward pass) ---- */
-    fprintf(stderr,"\n[Prefill] %d tokens (batch)...\n",prompt_len);
+    /* KV cache in ION — frees Linux heap, reduces swap */
+    sm_kv_cache_t *kv=sm_kv_alloc_ion(&pool, max_seq, c.d_qkv, c.n_layers, ctx.rt_handle);
+    if(!kv){fprintf(stderr,"KV cache alloc failed!\n");return 1;}
+    fprintf(stderr, "[swap] after kv_alloc_ion: VmSwap=%d KB\n", get_swap_kb());
+
+    /* Pipeline mode from actual ION free space after KV allocation */
+    pool.pipeline_mode = pool_calc_pipeline_mode(pool.ion_free, pool.layer_sz);
+    if (force_mode) pool.pipeline_mode = force_mode;
+    pool.ion_n_slots = pool.pipeline_mode * 2;
+
+    /* ---- Chunked Prefill: TPU can handle at most 10 tokens/batch.
+     *   Split long prompts into chunks, accumulate KV cache across chunks,
+     *   only compute LM Head on the last chunk. ---- */
+    #define CHUNK_PREFILL 10
+    fprintf(stderr,"\n[Prefill] %d tokens (chunked, max %d/chunk)...\n",prompt_len,CHUNK_PREFILL);
     sm_timing_t t; memset(&t,0,sizeof(t));
     double t_prefill=TICK();
-    float *all_logits=(float*)malloc(prompt_len * V * sizeof(float));
-    if(!all_logits){fprintf(stderr,"OOM for prefill logits\n");return 1;}
-    int rc=sm_forward_pool(&ctx,cvk,nm,&c,weight_dir,token_ids,prompt_len,0,kv,all_logits,&pool,rope_cos,rope_sin,&t);
-    if(rc){fprintf(stderr,"Prefill failed rc=%d\n",rc);free(all_logits);return 1;}
-    t_prefill=TICK()-t_prefill;
-    int next_token=sample_argmax(all_logits+(prompt_len-1)*V, V);
-    free(all_logits);
+    float *chunk_logits=(float*)malloc(CHUNK_PREFILL * V * sizeof(float));
+    if(!chunk_logits){fprintf(stderr,"OOM for chunk logits\n");return 1;}
+
+    int next_token = 0;
+    for (int start = 0; start < prompt_len; start += CHUNK_PREFILL) {
+        int chunk = (start + CHUNK_PREFILL <= prompt_len) ? CHUNK_PREFILL : prompt_len - start;
+        int is_last = (start + chunk >= prompt_len);
+        float *logits_ptr = is_last ? chunk_logits : NULL;
+        int rc = sm_forward_pool(&ctx, cvk, nm, &c, weight_dir,
+                                  &token_ids[start], chunk, start,
+                                  kv, logits_ptr,
+                                  &pool, rope_cos, rope_sin, &t, is_last);
+        if (rc) {
+            fprintf(stderr,"Prefill chunk start=%d failed rc=%d\n", start, rc);
+            free(chunk_logits); return 1;
+        }
+        if (is_last) {
+            next_token = sample_argmax(chunk_logits + (chunk - 1) * V, V);
+        }
+    }
+    free(chunk_logits);
+    t_prefill = TICK() - t_prefill;
     fprintf(stderr,"  Prefill: %.0f ms, next_token=%d\n",t_prefill/1000.0,next_token);
 
     /* ---- Decode ---- */
     fprintf(stderr,"\n[Decode] %d tokens...\n",max_new);
-    int generated[256],n_gen=0; generated[n_gen++]=next_token;
+    fprintf(stderr,"[swap] before decode: VmSwap=%d KB\n", get_swap_kb());
+    int generated[256],n_gen=0;
+    printf("%d\n", next_token); fflush(stdout);  /* stream first token (from prefill) */
+    generated[n_gen++]=next_token;
     double t_decode_total=0; int kv_len=prompt_len;
 
     for(int step=0;step<max_new;step++){
+        int sw_now = get_swap_kb();
         int tid[1]={next_token};
         float *step_logits=(float*)malloc(V*sizeof(float));
         double t_step=TICK();
-        int rc=sm_forward_pool(&ctx,cvk,nm,&c,weight_dir,tid,1,kv_len,kv,step_logits,&pool,rope_cos,rope_sin,&t);
+        int rc=sm_forward_pool(&ctx,cvk,nm,&c,weight_dir,tid,1,kv_len,kv,step_logits,&pool,rope_cos,rope_sin,&t,1);
         t_step=TICK()-t_step; t_decode_total+=t_step; kv_len++;
         if(rc){fprintf(stderr,"Decode step %d failed rc=%d\n",step,rc);break;}
-        next_token=sample_argmax(step_logits,V); free(step_logits);
-        if(next_token<=0||next_token>=V)break;
+        next_token=sample_argmax(step_logits,V);  /* log top-5 */
+        next_token=sample_softmax(step_logits,V,1.5f,40);  /* temperature sampling */
+        free(step_logits);
+        if(next_token<0||next_token>=V)break;
+        printf("%d\n", next_token); fflush(stdout);  /* stream token */
         generated[n_gen++]=next_token;
-        if((step+1)%5==0)fprintf(stderr,"  step %d: tok=%d, %.0f ms (avg %.0f ms/tok)\n",
-            step+1,next_token,t_step/1000.0,t_decode_total/1000.0/(step+1));
+        if(next_token == eos_id) {
+            fprintf(stderr,"  step %d: EOS (tok=%d), stopping\n", step+1, next_token);
+            break;
+        }
+        if((step+1)%5==0)fprintf(stderr,"  step %d: tok=%d, %.0f ms (avg %.0f ms/tok) swap=%dK\n",
+            step+1,next_token,t_step/1000.0,t_decode_total/1000.0/(step+1), sw_now);
     }
 
     /* ---- Report ---- */
@@ -1731,11 +2009,13 @@ int main(int argc, char **argv) {
     fprintf(stderr,"Scores:%8.0f ms  SM:   %8.0f ms  Attn:   %8.0f ms\n",t.t_scores/1000.0/ns,t.t_softmax/1000.0/ns,t.t_attn/1000.0/ns);
     fprintf(stderr,"Wo:    %8.0f ms  RMS_f:%8.0f ms  FFN_up: %8.0f ms\n",t.t_wo/1000.0/ns,t.t_rms_ffn/1000.0/ns,t.t_ffn_up/1000.0/ns);
     fprintf(stderr,"FFN_dn:%8.0f ms  Final:%8.0f ms  LM_Head:%8.0f ms\n",t.t_ffn_down/1000.0/ns,t.t_final_rms/1000.0/ns,t.t_lm_head/1000.0/ns);
-    fprintf(stderr,"\n--- Tokens ---\n");
+    fprintf(stderr,"\n--- Tokens (%d) ---\n", n_gen);
     for(int i=0;i<n_gen;i++)fprintf(stderr,"%d ",generated[i]); fprintf(stderr,"\n");
 
     free(rope_cos);free(rope_sin);free(token_ids);
     if(g_scales)free(g_scales);
+    if(g_embed_scales)free(g_embed_scales);
+    if(g_layer_scales)free(g_layer_scales);
     sm_kv_free(kv,&c,ctx.rt_handle); pool_free(&pool,ctx.rt_handle);
     tpu_cleanup(&ctx);
     return 0;

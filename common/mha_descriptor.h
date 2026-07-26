@@ -57,6 +57,9 @@ enum MHA_CMD_ID {
     CMD_MHA_DEQUANTIZE  = 0x26,
     CMD_MHA_DDR_TO_ION   = 0x27,
     CMD_MHA_EMBED_XPOSE  = 0x28,
+    CMD_MHA_SD_TAKE_OWNER = 0x30,
+    CMD_MHA_SD_READ_LAYER = 0x31,
+    CMD_MHA_SD_RELEASE    = 0x32,
     CMD_MHA_DONE        = 0x7F,
 };
 
