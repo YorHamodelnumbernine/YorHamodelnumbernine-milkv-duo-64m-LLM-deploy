@@ -736,51 +736,60 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
  *  Memory: staging = 2 * layer_sz (~6.8 MB).  Fits in remaining DDR.
  * ================================================================ */
 typedef struct {
-    uint8_t     *buf;           /* staging buffer for one layer        */
-    int          layer_id;      /* which layer to load                */
-    int          sz;            /* layer_sz bytes                     */
-    int          ready;         /* 0=loading, 1=done, -1=error       */
+    uint8_t     *buf;           /* base staging buffer for the batch   */
+    int          layer_id;      /* first layer to load                 */
+    int          n;             /* number of consecutive layers        */
+    int          sz;            /* layer_sz bytes per layer            */
+    int          ready;         /* 0=loading, 1=done, -1=error         */
     const char  *weight_dir;
     pthread_t        tid;
     pthread_mutex_t  lock;
     pthread_cond_t   cond;
 } pf_job_t;
 
+/* Change C: ONE thread reads the whole batch (n consecutive layer files)
+ * SEQUENTIALLY.  Measured SD sequential throughput is ~16-19MB/s vs
+ * ~8-10MB/s aggregate for N concurrent readers, so merging the reads
+ * into a single thread roughly halves the wall time spent pulling a
+ * batch off the SD card.  The overlap with TPU compute is preserved:
+ * this thread runs on a separate pthread while the main thread computes
+ * the active bank. */
 static void *pf_worker(void *arg) {
     pf_job_t *j = (pf_job_t *)arg;
-    char path[256];
+    int ok = 1;
 
-    snprintf(path, sizeof(path), "%s/layer%d.bin", j->weight_dir, j->layer_id);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        pthread_mutex_lock(&j->lock);
-        j->ready = -1;
-        pthread_cond_signal(&j->cond);
-        pthread_mutex_unlock(&j->lock);
-        return NULL;
+    for (int i = 0; i < j->n; i++) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/layer%d.bin",
+                 j->weight_dir, j->layer_id + i);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { ok = 0; break; }
+        int remain = j->sz;
+        uint8_t *dst = j->buf + (size_t)i * j->sz;
+        while (remain > 0) {
+            int n = read(fd, dst, remain);
+            if (n <= 0) { ok = 0; break; }
+            dst += n; remain -= n;
+        }
+        close(fd);
+        if (!ok) break;
     }
-    int remain = j->sz, ok = 1;
-    uint8_t *dst = j->buf;
-    while (remain > 0) {
-        int n = read(fd, dst, remain);
-        if (n <= 0) { ok = 0; break; }
-        dst += n; remain -= n;
-    }
-    close(fd);
 
     pthread_mutex_lock(&j->lock);
-    j->ready = (ok && remain == 0) ? 1 : -1;
+    j->ready = ok ? 1 : -1;
     pthread_cond_signal(&j->cond);
     pthread_mutex_unlock(&j->lock);
     return NULL;
 }
 
-/* Start a thread to load the layer.  Returns 0 on success, -1 if
- * pthread_create fails (e.g. OOM). */
-static int pf_start(pf_job_t *j, const char *weight_dir, int layer_id,
-                     int sz, uint8_t *buf) {
+/* Start a thread to load a whole batch (n consecutive layers) into
+ * buf[0..n-1].  Returns 0 on success, -1 if pthread_create fails
+ * (e.g. OOM). */
+static int pf_start(pf_job_t *j, const char *weight_dir, int first_layer,
+                     int n, int sz, uint8_t *buf) {
     j->weight_dir = weight_dir;
-    j->layer_id   = layer_id;
+    j->layer_id   = first_layer;
+    j->n          = n;
     j->sz         = sz;
     j->buf        = buf;
     j->ready      = 0;
@@ -1028,7 +1037,7 @@ static int mbox_cache_flush_async(tpu_ctx *ctx, int slot,
 #define DDR_POOL_MIN     0x400000    /* fallback 4 MB */
 #define ION_MAX_SLOTS    7           /* max layer slots in ION */
 #define DDR_MAX_OVERFLOW 5           /* max DDR overflow layers */
-#define MBOX_TIMEOUT_US  2000000     /* 2 sec timeout for secondary core commands */
+#define MBOX_TIMEOUT_US  500000      /* 500ms timeout: EMBED_XPOSE 1.18MB takes ~ms; fail fast */
 
 static uint8_t io_buf[256 * 1024];   /* staging buffer in BSS — zero heap pressure */
 
@@ -1484,13 +1493,14 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
     int bank_a = 0, bank_b = batch_slots;
     int use_pipeline = (ion_n_slots >= 2 * batch_slots);
 
-    /* pf_job_t for direct SD→ION reads (3 threads, one per batch slot) */
-    pf_job_t jobs[batch_slots];
-    for (int j = 0; j < batch_slots; j++) {
-        memset(&jobs[j], 0, sizeof(jobs[j]));
-        pthread_mutex_init(&jobs[j].lock, NULL);
-        pthread_cond_init(&jobs[j].cond, NULL);
-    }
+    /* Change C: single prefetch thread reads the whole next batch
+     * sequentially.  Overlap with TPU compute on Bank A is preserved:
+     * the thread runs while the main thread computes the active bank. */
+    pf_job_t pf_batch;
+    int pf_inflight = 0;
+    memset(&pf_batch, 0, sizeof(pf_batch));
+    pthread_mutex_init(&pf_batch.lock, NULL);
+    pthread_cond_init(&pf_batch.cond, NULL);
 
     if (use_pipeline) {
         fprintf(stderr, "  [pipeline] ION %d+%d batch: compute Bank A | SD→Bank B\n",
@@ -1517,13 +1527,13 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
             CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
             t->t_weight_load += TICK() - ts;
 
-            /* Start prefetching second batch (layers 3-5) into Bank B */
-            for (int i = 0; i < batch_slots; i++) {
-                if (pf_start(&jobs[i], weight_dir, batch_slots + i,
-                             layer_sz, ion_va + (bank_b + i) * layer_sz) != 0) {
-                    use_pipeline = 0; break;
-                }
+            /* Start prefetching second batch (layers 3-5) into Bank B —
+             * one thread, sequential file reads (Change C). */
+            if (pf_start(&pf_batch, weight_dir, batch_slots, batch_slots,
+                         layer_sz, ion_va + bank_b * layer_sz) != 0) {
+                use_pipeline = 0;
             }
+            if (use_pipeline) pf_inflight = 1;
         }
 
         if (use_pipeline) {
@@ -1543,9 +1553,9 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
                                               rope_cos, rope_sin, lt,
                                               pool->work_f32, pool->work_i8);
                     if (rc) {
-                        for (int j = 0; j < batch_slots; j++)
-                            pthread_mutex_destroy(&jobs[j].lock),
-                            pthread_cond_destroy(&jobs[j].cond);
+                        if (pf_inflight) { pf_wait(&pf_batch); pf_inflight = 0; }
+                        pthread_mutex_destroy(&pf_batch.lock);
+                        pthread_cond_destroy(&pf_batch.cond);
                         free(x); return rc;
                     }
                     t->t_rms_attn += lt[0];  t->t_q      += lt[1];
@@ -1559,11 +1569,10 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
                 /* Last batch done — compute complete, break */
                 if (is_last) break;
 
-                /* ---- Wait for prefetch into Bank B ---- */
+                /* ---- Wait for prefetch into Bank B (single thread) ---- */
                 ts = TICK();
-                for (int i = 0; i < batch_slots; i++) {
-                    if (pf_wait(&jobs[i]) != 0) { use_pipeline = 0; break; }
-                }
+                if (pf_wait(&pf_batch) != 0) { use_pipeline = 0; }
+                pf_inflight = 0;
                 if (!use_pipeline) break;
                 CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
                 t->t_weight_load += TICK() - ts;
@@ -1573,11 +1582,14 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
 
                 /* ---- Start prefetching next batch into (new) Bank B ---- */
                 int next_start = batch_start + 2 * batch_slots;
-                for (int i = 0; i < batch_slots && (next_start + i) < L; i++) {
-                    if (pf_start(&jobs[i], weight_dir, next_start + i,
-                                 layer_sz, ion_va + (bank_b + i) * layer_sz) != 0) {
+                int n_pf = (next_start < L) ? (L - next_start) : 0;
+                if (n_pf > batch_slots) n_pf = batch_slots;
+                if (n_pf > 0) {
+                    if (pf_start(&pf_batch, weight_dir, next_start, n_pf,
+                                 layer_sz, ion_va + bank_b * layer_sz) != 0) {
                         use_pipeline = 0; break;
                     }
+                    pf_inflight = 1;
                 }
             }
 
@@ -1621,10 +1633,9 @@ fallback:
         }
     }
 
-    for (int j = 0; j < batch_slots; j++) {
-        pthread_mutex_destroy(&jobs[j].lock);
-        pthread_cond_destroy(&jobs[j].cond);
-    }
+    if (pf_inflight) { pf_wait(&pf_batch); pf_inflight = 0; }
+    pthread_mutex_destroy(&pf_batch.lock);
+    pthread_cond_destroy(&pf_batch.cond);
 
     /* ---- LM Head: stream embed chunks, transpose via mbox or CPU.
      *   Double-buffered in ION pool memory.
@@ -1641,7 +1652,19 @@ fallback:
     t->t_final_rms += TICK() - ts;
 
     ts = TICK();
-    int CHUNK = 1024;
+    /* CHUNK sizing (Change A): transposed-chunk buffers (4 × D×CHUNK) must fit
+     * in the ION region freed by the layer weight slots.  Bigger CHUNK = fewer
+     * submits, larger sequential SD reads (better bandwidth).  Auto-downgrades
+     * to 2048 in 1+1 mode, 4096 in 2+2/3+3 modes. */
+    int weight_region = pool->ion_n_slots * pool->layer_sz;
+    int CHUNK = 4096;
+    /* Secondary-core EMBED_XPOSE rejects cur_v > 2048 (comm_main.c). */
+    if (pool->use_mbox && CHUNK > 2048) CHUNK = 2048;
+    while (CHUNK * D * 4 > weight_region) CHUNK /= 2;
+    if (CHUNK < 512) CHUNK = 512;
+    int n_lm_chunks = (V + CHUNK - 1) / CHUNK;
+    fprintf(stderr, "  [LM_Head] CHUNK=%d (%d chunks, %.2f MB/chunk, weight_region=%d KB)\n",
+            CHUNK, n_lm_chunks, (double)(D * CHUNK) / 1024 / 1024, weight_region/1024);
     float sc_final = compute_scale_sym(final_normed, n_tokens * D);
     int8_t *x_final_i8 = (int8_t *)malloc(n_tokens * D);
     quantize_i8_sym(x_final_i8, final_normed, n_tokens * D, sc_final);
@@ -1679,25 +1702,46 @@ fallback:
     int emb_ddr = pool->embed_ddr_bytes;
     int emb_ion = pool->embed_ion_bytes;
     int emb_ion_off = pool->embed_ion_offset;
-    #define LM_CACHE_READ(dst_va, file_off, len) do { \
-        off_t _off = (file_off); \
-        int   _len = (len); \
+
+    /* ---- Async next-chunk prefetch (Change B).
+     * Cache-aware chunk load: DDR > ION > async SD.
+     * Cache hits are sync memcpy (fast, microseconds).  SD fallback is a
+     * background thread (ef_job_t) that overlaps with the current chunk's
+     * transpose + matmul + dequant.  This hides most of the SD latency that
+     * was previously exposed synchronously on the critical path. ---- */
+    static ef_job_t lm_job;
+    static int      lm_job_pending = 0;
+    static int      lm_sd_chunks   = 0;   /* diagnostics: chunks read from SD */
+    lm_sd_chunks = 0;
+
+    #define LM_LOAD_CHUNK(dst_va, v_start_, cur_v_) do { \
+        off_t _off = (off_t)(v_start_) * D; \
+        int   _len = D * (cur_v_); \
         if (_off + _len <= emb_ddr) { \
             memcpy((dst_va), pool->ddr_base + _off, _len); \
+            lm_job_pending = 0; \
         } else if (emb_ion > 0 && _off >= emb_ddr && \
                    _off + _len <= emb_ddr + emb_ion) { \
             memcpy((dst_va), pool->ion_vaddr + emb_ion_off + (_off - emb_ddr), _len); \
+            lm_job_pending = 0; \
         } else { \
-            lseek(pool->embed_fd, _off, SEEK_SET); \
-            read(pool->embed_fd, (dst_va), _len); \
+            lm_sd_chunks++; \
+            if (ef_start(&lm_job, pool->embed_fd, _off, _len, (dst_va)) == 0) \
+                lm_job_pending = 1; \
+            else { /* thread create failed: fall back to sync read */ \
+                lseek(pool->embed_fd, _off, SEEK_SET); \
+                read(pool->embed_fd, (dst_va), _len); \
+                lm_job_pending = 0; \
+            } \
         } \
     } while(0)
 
-    /* Pre-load first chunk */
+    /* Pre-load first chunk (sync — memcpy or SD read) */
     {
         int v_start = 0;
         int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
-        LM_CACHE_READ(xpose_src[cur], v_start * D, D * cur_v);
+        LM_LOAD_CHUNK(xpose_src[cur], v_start, cur_v);
+        if (lm_job_pending) { ef_wait(&lm_job); lm_job_pending = 0; }
         CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
     }
 
@@ -1706,9 +1750,14 @@ fallback:
         int nxt = 1 - cur;
         int nxt_v_start = v_start + CHUNK;
 
+        /* xpose_src[cur] is ready here (preloaded or completed by prev
+         * iteration's async prefetch + ef_wait at the bottom of the loop). */
+
         if (nxt_v_start < V) {
             int nxt_cur_v = (nxt_v_start + CHUNK <= V) ? CHUNK : V - nxt_v_start;
-            LM_CACHE_READ(xpose_src[nxt], nxt_v_start * D, D * nxt_cur_v);
+            /* Start read of next chunk — for SD it is a background thread
+             * overlapped with the transpose+matmul+dequant below. */
+            LM_LOAD_CHUNK(xpose_src[nxt], nxt_v_start, nxt_cur_v);
         }
 
         if (lm_use_mbox) {
@@ -1761,10 +1810,17 @@ fallback:
             }
         }
 
-        if (nxt_v_start < V)
+        /* Wait for the next chunk's async SD read (running during the
+         * transpose+matmul+dequant above).  Cache-hit chunks skip this. */
+        if (nxt_v_start < V && lm_job_pending) {
+            ef_wait(&lm_job);
+            lm_job_pending = 0;
             CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
+        }
         cur = nxt;
     }
+    fprintf(stderr, "  [LM_Head] %d/%d chunks from SD\n",
+            lm_sd_chunks, n_lm_chunks);
     free(x_final_i8);
     t->t_lm_head += TICK() - ts;
     } /* need_lm_head */
