@@ -152,3 +152,63 @@ Tokens: 5021 1308 6990 154 (logit gap 1.0-5.8, 无自循环)
 - 改动 A+B（LM_Head CHUNK 放大 + 异步预取）：CEO 已验证，decode -9.3%。
 - 改动 C（权重预取串行化）：推理引擎工程师已验证，decode ~-10%。
 - 待办：突破 mbox 2048 上限（TPU 底层）、改动 D（r_is_nm=true）。
+
+---
+
+## 7. 干净联合复测（2026-08-08，CEO，交错 A/B ×3，设备空闲）
+
+在独立 worktree 构建原始基线（bb7e0cb，A/B/C 之前），与 A+B+C 交错各跑 3 次，
+同命令 `/root/smollm2_pool_demo{,base} /root/smollm2_instruct/ /root/input_tokens.bin 3 3 2`：
+
+| Run | 基线 Decode | A+B+C Decode |
+|-----|------------|--------------|
+| 1 | 37,642 ms | 31,320 ms |
+| 2 | 38,638 ms | 31,203 ms |
+| 3 | 38,463 ms | 31,340 ms |
+| **平均** | **38,248 ms (9,562 ms/tok)** | **31,288 ms (7,822 ms/tok)** |
+
+- **总提速 -18.2%**（基线内波动 ±1.3%，A+B+C 内波动 ±0.3%，结论可靠）。
+- LM_Head：基线 ~3,275ms → A+B+C ~2,559ms（**-22%**）。
+- 与预估一致：C(~10%) 与 A+B(~9%) 叠加 ≈ 1 − 0.9×0.82 ≈ 18%。
+- 注：绝对数值高于 §5 历史基线（7,609/6,904ms/tok），为设备漂移（设备连续运行 7d22h、
+  load 常态 3.0），**相对提升以本组交错 A/B 为准**。
+
+---
+
+## 8. TPU 底层工程师 Phase 2 调查结论（2026-08-08）
+
+### 8.1 真正瓶颈：副核 EMBED_XPOSE 转置本身（~11.5MB/s）
+
+- 微基准拆分（`bench_lmhead_cost.c`，Duo 实测）：LM_Head 每 chunk ~112ms 中，
+  **转置占 80%**（mbox CHUNK=2048 ≈ 100-106ms，带宽线性受限 11.5MB/s）。
+- 副核转置是 naive 双重跨 64B cache line 循环（comm_main.c L320-322），缓存极不友好。
+- 大核 blocked(BS=32) 转置实测 57ms vs naive 500ms（**~8× 加速**），可移植到副核。
+
+### 8.2 `cur_v≤2048` 来源与突破
+
+- **纯软件校验**：comm_main.c L310-311 `if (... || D>2048 || cur_v>2048)`。
+  非硬件/DMA/内存限制（rows/cols 为 uint32、size 2.36MB 无溢出、cache 操作为 64B 行）。
+  参考同文件 CMD_MHA_TRANSPOSE 已允许 >4096。
+- 突破 4096 可行：comm_main.c L311 + smollm2_pool_demo.c L1662 各 1 行。
+  ION 9.4MB 在 2+2/3+3 下安全，1+1 自动降档。
+
+### 8.3 收益修正
+
+| 项 | 原估计 | 修正后 | 原因 |
+|----|--------|--------|------|
+| 改动 A (CHUNK 4096) | 500-900ms | **~100-300ms** | 转置带宽受限，总工作量 V×D 恒定 |
+| 改动 D (r_is_nm=true) | 省 0.65-0.9s | **单独≈0** | 与改动 A 冲突（强制 CHUNK≤1024），省拷贝被转置次数翻倍吃掉 |
+
+### 8.4 推荐路线（Phase 3，按收益/风险排序）
+
+| 序 | 优化 | 改动点 | 预估收益 | 风险 |
+|----|------|--------|---------|------|
+| ① | **blocked 副核转置** | comm_main.c EMBED_XPOSE 改 BS=16/32 分块 | 转置 2.4s→0.4-0.8s（省 **1.6-2.0s**） | 中（固件，改动局部） |
+| ② | **转置与 matmul 重叠** | demo 侧 async send + 延后 wait（现有双缓冲） | 省 ~0.7s | 低 |
+| ③ | 改动 A (CHUNK 4096) | comm_main.c + demo 各 1 行 | ~0.1-0.3s | 低 |
+| ④ | 改动 D (r_is_nm=true) | demo 侧，CHUNK≤1024 | 单独~0；叠 ① 后 +0.65s | 低-中 |
+| ⑤ | TPU TDMA 硬件转置 | 研究 `tdma_g2l_matrix_copy_row_col_transposed` | 潜在消灭转置 | 高 |
+
+- **结论**：下一步优先 ①（blocked 副核转置，固件）+ ②（转置/matmul 重叠，demo）。
+  改动 A 顺手做（便宜），改动 D 只在 ① 完成后评估。
+- 已提交 `bench_lmhead_cost.c` 微基准工具（`make bench_lmhead_cost`）供后续验证。
