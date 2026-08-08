@@ -212,3 +212,51 @@ Tokens: 5021 1308 6990 154 (logit gap 1.0-5.8, 无自循环)
 - **结论**：下一步优先 ①（blocked 副核转置，固件）+ ②（转置/matmul 重叠，demo）。
   改动 A 顺手做（便宜），改动 D 只在 ① 完成后评估。
 - 已提交 `bench_lmhead_cost.c` 微基准工具（`make bench_lmhead_cost`）供后续验证。
+
+---
+
+## 9. 改动 ② 实测（2026-08-08，CEO 实施，转置/matmul 重叠 · Change B2）
+
+### 9.1 实现（demo 侧，无固件改动）
+
+把 LM_Head 的 mbox EMBED_XPOSE 转置从「同步 start+立即 poll」改为异步软件流水，
+迭代 i 内：
+- (a) 确认 chunk i+1 的 SD 读完成 → 异步启动 mbox 转置(i+1) 写入 xpose_dst[nxt]
+- (b) 启动 chunk i+2 的 SD 读（复用已释放的 xpose_src[cur]）
+- (c) matmul(i) + dequant(i)（读 xpose_dst[cur]）
+- (d) poll 转置(i+1)
+
+转置(i+1) 因此与 matmul(i)+dequant(i) 重叠，隐藏 ~100ms/chunk 的 EMBED_XPOSE
+延迟（带宽受限 11.5MB/s）。安全性：LM_Head matmul 的 neuron scratch 用量
+（M=1,K=576,tile_n=96 → 最高 ~56KB；prefill M≤36 → ~57KB）始终低于
+MHA_OFF_DMA_DESC=0x1F800，in-flight 描述符不会被 matmul 覆盖；mbox slot 0
+不与 DDR_TO_ION 并发。
+
+实现中发现并修复一个 off-by-one：step (b) 原写 `v2=nxt_v_start`（=chunk i+1），
+应为 `v2=nxt_v_start+CHUNK`（=chunk i+2）。该 bug 使 matmul(i) 读到转置(i-1)
+的数据（chunk≥2 全部错误），并跳过 chunk 23 的 SD 读（SD chunk 计数 13→12），
+表现为 prefill next_token 从 5021 漂移到 1582。修复后 prefill next_token 与
+SD chunk 计数均与基线一致。
+
+### 9.2 实测（Duo，与 §7 相同命令 `/root/smollm2_pool_{base,b2} ... 3 3 2`，
+交错 A/B ×3，设备常态 load 3.0）
+
+| Run | 基线 Decode | B2 Decode | 基线 LM_Head | B2 LM_Head |
+|-----|------------|-----------|--------------|-----------|
+| 1 | 31,416 ms | 27,273 ms | 2,586 ms | 1,833 ms |
+| 2 | 31,151 ms | 27,402 ms | 2,543 ms | 1,831 ms |
+| 3 | 31,310 ms | 27,305 ms | 2,537 ms | 1,825 ms |
+| **平均** | **31,292 ms (7,823/tok)** | **27,327 ms (6,832/tok)** | **2,555 ms** | **1,830 ms** |
+
+- **Decode -12.7%**；**LM_Head -725ms (-28.4%)**，与 §8.4 预估 ~0.7s 一致。
+- 基线 7,823 ms/tok 与 §7 干净复测的 7,822 ms/tok 几乎完全一致；B2 组内波动
+  ±0.3%，结论可靠。
+- 注：观测到 **transformer 本身的非确定性（预存在，与 B2 无关）**：基线自身
+  两次运行在第 3 个 decode token 处分歧（...6990 1291 vs ...6990 9391），
+  与 Change C 的权重预取/mbox 时序相关。A/B 以 decode 耗时为准。
+
+### 9.3 与 §8 路线对照
+
+- ②（转置/matmul 重叠，demo）✅ 完成并验证：LM_Head 2,555→1,830ms。
+- ①（blocked 副核转置，固件）→ 已派发 TPU 工程师评估烧写路径，待反馈。
+- ③ ④ ⑤ 维持 §8.4 结论（④ 仅在 ① 完成后评估）。

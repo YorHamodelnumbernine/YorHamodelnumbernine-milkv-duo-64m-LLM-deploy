@@ -1713,6 +1713,10 @@ fallback:
     static int      lm_job_pending = 0;
     static int      lm_sd_chunks   = 0;   /* diagnostics: chunks read from SD */
     lm_sd_chunks = 0;
+    /* Change B2: async sec-core EMBED_XPOSE transpose of the next chunk
+     * overlaps the current chunk's matmul+dequant.  lm_xpose_pending=1 while
+     * a transpose is in flight (must be polled before the next matmul). */
+    int lm_xpose_pending = 0;
 
     #define LM_LOAD_CHUNK(dst_va, v_start_, cur_v_) do { \
         off_t _off = (off_t)(v_start_) * D; \
@@ -1736,28 +1740,37 @@ fallback:
         } \
     } while(0)
 
-    /* Pre-load first chunk (sync — memcpy or SD read) */
+    /* ---- Change B2: overlap sec-core transpose with matmul ----
+     * Software-pipeline across chunks (steady state, iter i):
+     *   (a) confirm SD read(i+1) done → start async mbox transpose(i+1)
+     *   (b) kick off SD read(i+2)
+     *   (c) matmul(i) + dequant(i) using xpose_dst[cur]
+     *   (d) poll transpose(i+1)
+     * TRANSPOSE(i+1) therefore overlaps MATMUL(i)+DEQUANT(i), hiding the
+     * ~100ms/chunk mbox EMBED_XPOSE latency behind the matmul+dequant.
+     * Safe: LM_Head matmul scratch stays below MHA_OFF_DMA_DESC (0x1F800),
+     * so the in-flight descriptor is never clobbered. */
+    #define LM_CPU_TRANSPOSE(dst_buf, src_buf, v_cnt) do { \
+        for (int _j = 0; _j < D; _j++) \
+            for (int _v = 0; _v < (v_cnt); _v++) \
+                ((int8_t *)(dst_buf))[_j * (v_cnt) + _v] = \
+                    (int8_t)((src_buf)[_v * D + _j]); \
+        CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem); \
+    } while (0)
+
+    /* Pre-load chunk 0 (sync — memcpy or SD read), kick off chunk 1's async
+     * SD read (overlaps transpose(0) below), then transpose chunk 0 (sync). */
     {
         int v_start = 0;
         int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
         LM_LOAD_CHUNK(xpose_src[cur], v_start, cur_v);
         if (lm_job_pending) { ef_wait(&lm_job); lm_job_pending = 0; }
         CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
-    }
 
-    for (int v_start = 0; v_start < V; v_start += CHUNK) {
-        int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
-        int nxt = 1 - cur;
-        int nxt_v_start = v_start + CHUNK;
-
-        /* xpose_src[cur] is ready here (preloaded or completed by prev
-         * iteration's async prefetch + ef_wait at the bottom of the loop). */
-
-        if (nxt_v_start < V) {
+        if (V > CHUNK) {
+            int nxt_v_start = CHUNK;
             int nxt_cur_v = (nxt_v_start + CHUNK <= V) ? CHUNK : V - nxt_v_start;
-            /* Start read of next chunk — for SD it is a background thread
-             * overlapped with the transpose+matmul+dequant below. */
-            LM_LOAD_CHUNK(xpose_src[nxt], nxt_v_start, nxt_cur_v);
+            LM_LOAD_CHUNK(xpose_src[1 - cur], nxt_v_start, nxt_cur_v);
         }
 
         if (lm_use_mbox) {
@@ -1771,22 +1784,54 @@ fallback:
                 mha_dma_desc_t *desc = mbox_desc_ptr(nm_ptr, nm_pa, mbox_slot);
                 rc = mbox_poll_desc(ctx, desc, MBOX_TIMEOUT_US);
             }
-            if (rc != 0) {
-                lm_use_mbox = 0;
-                for (int j = 0; j < D; j++)
-                    for (int v = 0; v < cur_v; v++)
-                        ((int8_t *)xpose_dst[cur])[j * cur_v + v] =
-                            (int8_t)xpose_src[cur][v * D + j];
+            if (rc != 0) { lm_use_mbox = 0; LM_CPU_TRANSPOSE(xpose_dst[cur], xpose_src[cur], cur_v); }
+        } else {
+            LM_CPU_TRANSPOSE(xpose_dst[cur], xpose_src[cur], cur_v);
+        }
+    }
+
+    for (int v_start = 0; v_start < V; v_start += CHUNK) {
+        int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
+        int nxt = 1 - cur;
+        int nxt_v_start = v_start + CHUNK;
+        int has_nxt = nxt_v_start < V;
+
+        /* (a) Confirm SD read of chunk i+1 (kicked off in the previous
+         * iteration) and start the async mbox transpose of chunk i+1 into
+         * xpose_dst[nxt].  Cache-hit chunks skip the wait. */
+        if (has_nxt) {
+            int nxt_cur_v = (nxt_v_start + CHUNK <= V) ? CHUNK : V - nxt_v_start;
+            if (lm_job_pending) {
+                ef_wait(&lm_job);
+                lm_job_pending = 0;
                 CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
             }
-        } else {
-            for (int j = 0; j < D; j++)
-                for (int v = 0; v < cur_v; v++)
-                    ((int8_t *)xpose_dst[cur])[j * cur_v + v] =
-                        (int8_t)xpose_src[cur][v * D + j];
-            CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
+            if (lm_use_mbox) {
+                int mbox_slot = 0;
+                if (mbox_embed_xpose_async(ctx, mbox_slot,
+                                           xpose_src_pa[nxt], xpose_dst_pa[nxt],
+                                           D, nxt_cur_v) == 0) {
+                    lm_xpose_pending = 1;
+                } else {
+                    lm_use_mbox = 0;   /* fall through to CPU transpose */
+                }
+            }
+            if (!lm_use_mbox) {
+                LM_CPU_TRANSPOSE(xpose_dst[nxt], xpose_src[nxt], nxt_cur_v);
+                lm_xpose_pending = 0;
+            }
         }
 
+        /* (b) Kick off SD read of chunk i+2 into xpose_src[cur], freed by
+         * TRANSPOSE(i) which was confirmed done in the previous iteration. */
+        if (nxt_v_start + CHUNK < V) {
+            int v2 = nxt_v_start + CHUNK;   /* chunk i+2 */
+            int c2 = (v2 + CHUNK <= V) ? CHUNK : V - v2;
+            LM_LOAD_CHUNK(xpose_src[cur], v2, c2);
+        }
+
+        /* (c) matmul + dequant of current chunk using xpose_dst[cur], which
+         * was fully transposed before this iteration began. */
         rc_lm = tpu_matmul_build(ctx, cvk, x_final_i8, n_tokens, D,
                                   xpose_dst[cur], cur_v,
                                   lm_result_off, SM_SCRATCH_OFF, rshift_lm);
@@ -1810,12 +1855,18 @@ fallback:
             }
         }
 
-        /* Wait for the next chunk's async SD read (running during the
-         * transpose+matmul+dequant above).  Cache-hit chunks skip this. */
-        if (nxt_v_start < V && lm_job_pending) {
-            ef_wait(&lm_job);
-            lm_job_pending = 0;
-            CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
+        /* (d) Poll the async transpose of chunk i+1 (ran during the matmul+
+         * dequant above).  Fall back to CPU transpose on mbox failure. */
+        if (has_nxt && lm_xpose_pending) {
+            int nxt_cur_v = (nxt_v_start + CHUNK <= V) ? CHUNK : V - nxt_v_start;
+            uint8_t *nm_ptr = ctx->neuron_vaddr;
+            uint64_t nm_pa = CVI_RT_MemGetPAddr(ctx->neuron_mem);
+            mha_dma_desc_t *desc = mbox_desc_ptr(nm_ptr, nm_pa, 0);
+            if (mbox_poll_desc(ctx, desc, MBOX_TIMEOUT_US) != 0) {
+                lm_use_mbox = 0;
+                LM_CPU_TRANSPOSE(xpose_dst[nxt], xpose_src[nxt], nxt_cur_v);
+            }
+            lm_xpose_pending = 0;
         }
         cur = nxt;
     }
