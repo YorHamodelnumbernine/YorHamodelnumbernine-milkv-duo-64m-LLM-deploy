@@ -27,6 +27,25 @@
 #define TICK() ({ struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts); \
                   _ts.tv_sec * 1e6 + _ts.tv_nsec / 1e3; })
 
+/* ---- Task 1 step 1.1: LM_Head per-phase timing breakdown ----
+ * g_lm_brk_on is enabled only around the LM_Head block so the tile-copy /
+ * MemFlush instrumentation inside tpu_matmul_build() only runs there. */
+typedef struct {
+    uint64_t n_chunks;
+    uint64_t t_total;        /* whole LM_Head chunk loop */
+    uint64_t t_sd_wait;      /* ef_wait for async SD read */
+    uint64_t t_xpose_kick;   /* start async mbox transpose + flush */
+    uint64_t t_load;         /* LM_LOAD_CHUNK for chunk i+2 */
+    uint64_t t_matmul;       /* tpu_matmul_build() call */
+    uint64_t t_tile_copy;    /* tile memcpy (576xcn) inside build */
+    uint64_t t_tile_flush;   /* CVI_RT_MemFlush(1MB) inside build */
+    uint64_t t_submit;       /* CVI_RT_Submit + MemInvld */
+    uint64_t t_dequant;      /* dequant + scale */
+    uint64_t t_xpose_poll;   /* mbox_poll_desc */
+} lm_brk_t;
+static lm_brk_t g_lm_brk;
+static int      g_lm_brk_on = 0;
+
 /* ================================================================
  *  Runtime config
  * ================================================================ */
@@ -358,7 +377,14 @@ static int tpu_matmul_build(tpu_ctx *ctx, cvk_context_t *cvk,
     CVI_RT_MemFlush(ctx->rt_handle, ctx->neuron_mem);
     for(int ns=0;ns<N;ns+=tile_n){
         int cn=(ns+tile_n<=N)?tile_n:N-ns;
-        if(!r_is_nm){uint8_t*td=nm+off_r; for(int r=0;r<K;r++)memcpy(td+r*cn,r_i8+r*N+ns,cn); CVI_RT_MemFlush(ctx->rt_handle,ctx->neuron_mem);}
+        if(!r_is_nm){
+            uint64_t _ta = g_lm_brk_on ? TICK() : 0;
+            uint8_t*td=nm+off_r; for(int r=0;r<K;r++)memcpy(td+r*cn,r_i8+r*N+ns,cn);
+            uint64_t _tb = g_lm_brk_on ? TICK() : 0;
+            CVI_RT_MemFlush(ctx->rt_handle,ctx->neuron_mem);
+            uint64_t _tc = g_lm_brk_on ? TICK() : 0;
+            if (g_lm_brk_on) { g_lm_brk.t_tile_copy += _tb - _ta; g_lm_brk.t_tile_flush += _tc - _tb; }
+        }
         cvk_ml_t*ml_l=cvk->ops->lmem_alloc_matrix(cvk,cvk->ops->ml_default_shape(cvk,M,K,CVK_FMT_I8),CVK_FMT_I8,1);
         cvk_ml_t*ml_r=cvk->ops->lmem_alloc_matrix(cvk,cvk->ops->ml_default_shape(cvk,K,cn,CVK_FMT_I8),CVK_FMT_I8,1);
         cvk_ml_t*ml_o=cvk->ops->lmem_alloc_matrix(cvk,cvk->ops->ml_default_shape(cvk,M,cn,CVK_FMT_I8),CVK_FMT_I8,1);
@@ -1035,6 +1061,7 @@ static int mbox_cache_flush_async(tpu_ctx *ctx, int slot,
 #define ION_POOL_SZ      0x1800000   /* 24 MB */
 #define DDR_POOL_TRY     0xC00000    /* 12 MB — bigger embed cache */
 #define DDR_POOL_MIN     0x400000    /* fallback 4 MB */
+#define EMBED_DDR_DEFAULT 0x200000   /* 2 MB — Phase 4 variant (c) default DDR embed cache */
 #define ION_MAX_SLOTS    7           /* max layer slots in ION */
 #define DDR_MAX_OVERFLOW 5           /* max DDR overflow layers */
 #define MBOX_TIMEOUT_US  500000      /* 500ms timeout: EMBED_XPOSE 1.18MB takes ~ms; fail fast */
@@ -1123,10 +1150,37 @@ static int pool_init(pool_t *p, CVI_RT_HANDLE rt, const char *weight_dir,
 
     /* --- Decide embedding split: DDR only.
      *   ION is 100% for layer weights (3+3 double-buffer pipeline).
-     *   Embed rows beyond DDR are streamed from SD via embed_fd. */
+     *   Embed rows beyond DDR are streamed from SD via embed_fd.
+     *
+     *   Task 1 diagnosis: the malloc'd DDR embed cache gets swapped out on
+     *   this 28MB-RAM box, so LM_Head chunk loads (1.125MB memcpy) page-fault
+     *   at ~80-200ms each.
+     *
+     *   Phase 4 fix (variant c, CEO-approved): default the DDR embed cache to
+     *   a small 2MB so LM_Head chunk reads come from async SD (overlapped with
+     *   the current chunk's transpose+matmul) instead of sync swapped-DDR.
+     *   Measured: LM_Head 1248->834/845ms (-33%), Total -8~10%, next_token
+     *   stable; 2MB also relieves the swap/memory pressure behind the device
+     *   reboot + ION-orphan stability issues.
+     *
+     *   WARNING (never default to 0): LM_EMB_DDR_KB=0 pushes ALL embed reads
+     *   to SD, slamming the page cache hard enough to OOM-kill the process;
+     *   a SIGKILL leaks the ION allocation and poisons every later run until
+     *   the device is rebooted.  The env override is kept ONLY for diagnosis. */
     int ddr_embed_max = (int)p->ddr_sz;
     p->embed_ddr_bytes = p->embed_total;
     if (p->embed_ddr_bytes > ddr_embed_max) p->embed_ddr_bytes = ddr_embed_max;
+    if (p->embed_ddr_bytes > EMBED_DDR_DEFAULT) p->embed_ddr_bytes = EMBED_DDR_DEFAULT;
+    {
+        const char *kb = getenv("LM_EMB_DDR_KB");
+        if (kb) {
+            int cap = atoi(kb) * 1024;
+            if (cap >= 0 && cap < p->embed_ddr_bytes) p->embed_ddr_bytes = cap;
+            if (cap <= 0)
+                fprintf(stderr, "  WARNING: LM_EMB_DDR_KB=%s forces ALL embed from SD — "
+                        "OOM-kill + ION-leak poison risk; diagnosis only.\n", kb);
+        }
+    }
 
     /* --- ION layer slots: entire ION for layer weights --- */
     p->ion_layer_off = 0;
@@ -1642,6 +1696,8 @@ fallback:
      *   Skipped for intermediate chunks in chunked prefill. ---- */
     if (need_lm_head) {
     ts = TICK();
+    memset(&g_lm_brk, 0, sizeof(g_lm_brk));
+    g_lm_brk_on = 1;   /* Task 1 step 1.1: enable per-phase breakdown */
     float *final_normed = (float *)malloc(n_tokens * D * sizeof(float));
     float *final_rms = (float *)malloc(D * sizeof(float));
     char path[256];
@@ -1663,8 +1719,10 @@ fallback:
     while (CHUNK * D * 4 > weight_region) CHUNK /= 2;
     if (CHUNK < 512) CHUNK = 512;
     int n_lm_chunks = (V + CHUNK - 1) / CHUNK;
-    fprintf(stderr, "  [LM_Head] CHUNK=%d (%d chunks, %.2f MB/chunk, weight_region=%d KB)\n",
-            CHUNK, n_lm_chunks, (double)(D * CHUNK) / 1024 / 1024, weight_region/1024);
+    fprintf(stderr, "  [LM_Head] CHUNK=%d (%d chunks, %.2f MB/chunk, weight_region=%d KB) "
+            "emb_ddr=%dKB emb_ion=%dKB\n",
+            CHUNK, n_lm_chunks, (double)(D * CHUNK) / 1024 / 1024, weight_region/1024,
+            pool->embed_ddr_bytes/1024, pool->embed_ion_bytes/1024);
     float sc_final = compute_scale_sym(final_normed, n_tokens * D);
     int8_t *x_final_i8 = (int8_t *)malloc(n_tokens * D);
     quantize_i8_sym(x_final_i8, final_normed, n_tokens * D, sc_final);
@@ -1791,6 +1849,7 @@ fallback:
     }
 
     for (int v_start = 0; v_start < V; v_start += CHUNK) {
+        double _loop0 = TICK();
         int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
         int nxt = 1 - cur;
         int nxt_v_start = v_start + CHUNK;
@@ -1802,12 +1861,15 @@ fallback:
         if (has_nxt) {
             int nxt_cur_v = (nxt_v_start + CHUNK <= V) ? CHUNK : V - nxt_v_start;
             if (lm_job_pending) {
+                double _a0 = TICK();
                 ef_wait(&lm_job);
                 lm_job_pending = 0;
                 CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
+                g_lm_brk.t_sd_wait += (uint64_t)(TICK() - _a0);
             }
             if (lm_use_mbox) {
                 int mbox_slot = 0;
+                double _a1 = TICK();
                 if (mbox_embed_xpose_async(ctx, mbox_slot,
                                            xpose_src_pa[nxt], xpose_dst_pa[nxt],
                                            D, nxt_cur_v) == 0) {
@@ -1815,33 +1877,43 @@ fallback:
                 } else {
                     lm_use_mbox = 0;   /* fall through to CPU transpose */
                 }
+                g_lm_brk.t_xpose_kick += (uint64_t)(TICK() - _a1);
             }
             if (!lm_use_mbox) {
+                double _a2 = TICK();
                 LM_CPU_TRANSPOSE(xpose_dst[nxt], xpose_src[nxt], nxt_cur_v);
                 lm_xpose_pending = 0;
+                g_lm_brk.t_xpose_poll += (uint64_t)(TICK() - _a2);
             }
         }
 
         /* (b) Kick off SD read of chunk i+2 into xpose_src[cur], freed by
          * TRANSPOSE(i) which was confirmed done in the previous iteration. */
+        double _b0 = TICK();
         if (nxt_v_start + CHUNK < V) {
             int v2 = nxt_v_start + CHUNK;   /* chunk i+2 */
             int c2 = (v2 + CHUNK <= V) ? CHUNK : V - v2;
             LM_LOAD_CHUNK(xpose_src[cur], v2, c2);
         }
+        g_lm_brk.t_load += (uint64_t)(TICK() - _b0);
 
         /* (c) matmul + dequant of current chunk using xpose_dst[cur], which
          * was fully transposed before this iteration began. */
+        double _c0 = TICK();
         rc_lm = tpu_matmul_build(ctx, cvk, x_final_i8, n_tokens, D,
                                   xpose_dst[cur], cur_v,
                                   lm_result_off, SM_SCRATCH_OFF, rshift_lm);
+        g_lm_brk.t_matmul += (uint64_t)(TICK() - _c0);
         if (!rc_lm) {
+            double _c1 = TICK();
             CVI_RT_Submit(ctx->rt_khandle);
             CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem);
+            g_lm_brk.t_submit += (uint64_t)(TICK() - _c1);
         }
         if (rc_lm) { free(x_final_i8); free(x); free(logits_out); return -1; }
 
         int8_t *logits_i8 = (int8_t *)(nm + lm_result_off);
+        double _d0 = TICK();
         for (int t = 0; t < n_tokens; t++) {
             float *lt_out = logits_out + t * V + v_start;
             int8_t *lt_i8  = logits_i8 + t * cur_v;
@@ -1854,6 +1926,7 @@ fallback:
                            EMBED_SCALE, sc_final, rshift_lm);
             }
         }
+        g_lm_brk.t_dequant += (uint64_t)(TICK() - _d0);
 
         /* (d) Poll the async transpose of chunk i+1 (ran during the matmul+
          * dequant above).  Fall back to CPU transpose on mbox failure. */
@@ -1862,16 +1935,50 @@ fallback:
             uint8_t *nm_ptr = ctx->neuron_vaddr;
             uint64_t nm_pa = CVI_RT_MemGetPAddr(ctx->neuron_mem);
             mha_dma_desc_t *desc = mbox_desc_ptr(nm_ptr, nm_pa, 0);
+            double _d1 = TICK();
             if (mbox_poll_desc(ctx, desc, MBOX_TIMEOUT_US) != 0) {
                 lm_use_mbox = 0;
+                double _d2 = TICK();
                 LM_CPU_TRANSPOSE(xpose_dst[nxt], xpose_src[nxt], nxt_cur_v);
+                g_lm_brk.t_xpose_poll += (uint64_t)(TICK() - _d2);
             }
+            g_lm_brk.t_xpose_poll += (uint64_t)(TICK() - _d1);
             lm_xpose_pending = 0;
         }
         cur = nxt;
+        g_lm_brk.n_chunks++;
+        g_lm_brk.t_total += (uint64_t)(TICK() - _loop0);
     }
     fprintf(stderr, "  [LM_Head] %d/%d chunks from SD\n",
             lm_sd_chunks, n_lm_chunks);
+    if (g_lm_brk.n_chunks) {
+        uint64_t u = g_lm_brk.n_chunks;
+        uint64_t sum_ph = g_lm_brk.t_sd_wait + g_lm_brk.t_xpose_kick +
+                          g_lm_brk.t_load + g_lm_brk.t_matmul +
+                          g_lm_brk.t_submit + g_lm_brk.t_dequant +
+                          g_lm_brk.t_xpose_poll;
+        int64_t other = (int64_t)g_lm_brk.t_total - (int64_t)sum_ph;
+        fprintf(stderr,
+            "  [LM_Head brk] chunks=%llu avg_total=%.2fms "
+            "tile_copy=%.2f(%.1f%%) flush=%.2f(%.1f%%) matmul=%.2f(%.1f%%) "
+            "submit=%.2f(%.1f%%) dequant=%.2f(%.1f%%) sd_wait=%.2f(%.1f%%) "
+            "xpose_kick=%.2f(%.1f%%) load=%.2f(%.1f%%) poll=%.2f(%.1f%%) "
+            "OTHER=%.2f(%.1f%%)\n",
+            (unsigned long long)u,
+            g_lm_brk.t_total/1000.0/u,
+            g_lm_brk.t_tile_copy/1000.0/u, 100.0*g_lm_brk.t_tile_copy/g_lm_brk.t_total,
+            g_lm_brk.t_tile_flush/1000.0/u, 100.0*g_lm_brk.t_tile_flush/g_lm_brk.t_total,
+            g_lm_brk.t_matmul/1000.0/u,    100.0*g_lm_brk.t_matmul/g_lm_brk.t_total,
+            g_lm_brk.t_submit/1000.0/u,    100.0*g_lm_brk.t_submit/g_lm_brk.t_total,
+            g_lm_brk.t_dequant/1000.0/u,   100.0*g_lm_brk.t_dequant/g_lm_brk.t_total,
+            g_lm_brk.t_sd_wait/1000.0/u,   100.0*g_lm_brk.t_sd_wait/g_lm_brk.t_total,
+            g_lm_brk.t_xpose_kick/1000.0/u,100.0*g_lm_brk.t_xpose_kick/g_lm_brk.t_total,
+            g_lm_brk.t_load/1000.0/u,      100.0*g_lm_brk.t_load/g_lm_brk.t_total,
+            g_lm_brk.t_xpose_poll/1000.0/u,100.0*g_lm_brk.t_xpose_poll/g_lm_brk.t_total,
+            other/1000.0/u, 100.0*other/g_lm_brk.t_total);
+        /* note: tile_copy+flush are a subset of matmul (host-side prep only) */
+    }
+    g_lm_brk_on = 0;
     free(x_final_i8);
     t->t_lm_head += TICK() - ts;
     } /* need_lm_head */
