@@ -309,3 +309,62 @@ SD chunk 计数均与基线一致。
 - CEO 确认后：备份 `/boot/fip.bin` → 部署 → `bench_lmhead_cost` 验证
   （预期 @2048 从 100ms → 55-75ms，bad=0）→ `smollm2_pool_demo` 回归
   （LM_Head 1,830ms → 预期 ~1,300-1,500ms）。
+
+---
+
+## 11. Phase 3 · 优化① 部署与实测结果（2026-08-09，CEO 确认后执行）
+
+### 11.1 部署（可逆，已验证）
+
+- 固件产物：`/tmp/fip_blocked.bin`（sha256 `2693d03a…`，322560B）；存档
+  `fsbl/build/cv1800b_milkv_duo_sd/fip_blocked_phase3.bin`。
+- 部署前备份：`/boot/fip.bin → /boot/fip_pre_blocked_phase3.bak`
+  （`a000efa9…`，与烧写前完全一致）。
+- 烧写后 `/boot/fip.bin` = `2693d03a…`，重启 ~20s 恢复，无 hang。
+- 唯一源码变更：`comm_main.c` L320-326 EMBED_XPOSE naive 循环 → **blocked BS=32**
+  （`EMBED_XPOSE_BS` 宏）；L311 `cur_v>2048` 上限未动。输出布局/描述符语义不变。
+
+### 11.2 微基准（bench_lmhead_cost，设备实测）
+
+| 项 | naive（烧写前） | blocked（烧写后） | 加速 |
+|---|---|---|---|
+| [3] busy-poll cur_v=1024 | 58.36 ms | 21.41 ms | 2.7× |
+| [3] busy-poll cur_v=2048 | 106.45 ms | 29.79 ms | 3.6× |
+| [3b] SEND_WAIT cur_v=2048 | 100.31 ms（bad=0） | **26.58 ms（bad=0）** | **3.8×** |
+
+验收标准（@2048 55-75ms、bad=0）**远超达标**：26.58ms、bad=0（比最优预估快 ~2 倍）。
+
+### 11.3 生产回归（交错 A/B ×2，§9.2 精确命令
+`/root/smollm2_pool_{base,b2} /root/smollm2_instruct/ /root/input_tokens.bin 3 3 2`）
+
+| 指标 | 旧固件 §9.2 | 新固件（blocked）平均 | 变化 |
+|---|---|---|---|
+| base LM_Head | 2,555 ms | **1,343 ms** | **-1,212 ms (-47%)** |
+| b2 LM_Head | 1,830 ms | **1,242 ms** | **-588 ms (-32%)** |
+| base Decode | 31,292 ms | **22,588 ms** | **-8,704 ms (-28%)** |
+| b2 Decode | 27,327 ms | **22,030 ms** | **-5,297 ms (-19%)** |
+
+- next_token=5021、13/24 chunks SD 与基线完全一致（正确性完好）。
+- **b2 LM_Head 1,830→1,242ms**：低于 §10.3 预期 1,300-1,500ms，转置从关键路径
+  （~76ms/chunk）降到 ~30ms/chunk，每 chunk 关键路径转移到 TPU build+dequant（~40ms）。
+- **base 收益（-47%）> b2 收益（-32%）**：base 无转置重叠，blocked 直接释放其串行关键路径；
+  b2 已把转置藏在 matmul 后，提速被重叠吸收，符合 §10.3 推演。
+
+### 11.4 教训：回归必须用精确同命令
+
+- TPU 工程师首轮回归误用 `/root/smollm2_pool /root/test_tokens.bin 20`
+  （权重目录/token 文件/max_new 20/force_mode 0 全错），得 LM_Head 2,248ms，
+  一度误判「反而变慢」。改用 §9.2 精确命令（`smollm2_instruct/` + `input_tokens.bin` +
+  `3 3 2`）后 LM_Head 1,242ms，结论反转。
+- **教训：任何 A/B 必须复用基线精确命令与输入；测试工程师不得凭记忆拼参数。**
+
+### 11.5 结论与下一步
+
+- **固件① 已验证有效并保留**（系统稳定、转置正确、生产显著提速，无回滚理由）。
+- 转置已不再是 LM_Head 瓶颈；下一步候选（按预估收益）：
+  1. **改动 D 重新评估**（`r_is_nm=true`，neuron 单缓冲）：转置提速后，每 chunk 的
+     ION→neuron tile 拷贝+全量 MemFlush（28-37ms/chunk）成为主要残余开销；去掉后可再省
+     ~300-600ms。需验证单缓冲与 B2 双缓冲重叠的取舍（§8.3 曾估叠加快转置后 +0.65s）。
+  2. **Wt load 3.3s**（Change C 后续）：设备 load 下 SD 权重读取仍是全局最大单项。
+  3. **cur_v=4096**（L311 上限 + demo CHUNK）：独立正交，收益 ~100-300ms。
+- 回滚预案保持：`/boot/fip_pre_blocked_phase3.bak` 可一键恢复。
