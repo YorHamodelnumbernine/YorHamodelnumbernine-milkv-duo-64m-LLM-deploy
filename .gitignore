@@ -49,6 +49,9 @@ ps32_dec_spike
 # Path A gate / rounding probes (source kept)
 gate_a_check
 dbg_mm
+patha_kg32_check
+pathb_chunk_probe
+rs_noreload_check
 rshift_check
 
 # Personal dev helper (not part of the project)

@@ -73,3 +73,31 @@
 - `gate_a_check.c`（本次闸口探针：Gate ① 三组 + Gate ④b 九组宽度扫描）
 - `dbg_mm.c`（已知数据调试件，确定 round-half-up 语义：11440>>8→45）
 - `rshift_check.c`（小 rshift + 负数半值确认探针：rshift=1..4、K=32/128，6 组 bad=0）
+- `rs_noreload_check.c`（2026-08-13 晚补充探针：Gate ④a 同 LMEM 权重块、per-call rshift_bits、pass1/pass2 不重载）
+
+## 5. 补充签核（2026-08-13 晚，CEO 闸口核对 → 新增 ④a 上板验证）
+
+Path A 两遍法设计的 ④a 要求：pass1(rsafe) 与 pass2(r_opt) 用**同一 LMEM 权重块**、
+仅 rshift_bits 不同、**不重载**。此前 `patha_kg32_check.c` P2 两遍间实际重载了 right；
+本次 `rs_noreload_check.c` 上板直接验证不重载路径（RC=0）：
+
+| 测试 | 结构 | rshift | 结果 |
+|---|---|---|---|
+| Test A | 单 cmdbuf：g2l left/right 一次，matmul(11)→l2g P1，matmul(5)→l2g P2（同一 ml_r，无 right g2l） | 11 / 5 | 512/512 + 512/512 bad=0（pass2 含 408 个 sat8 值仍精确） |
+| Test B | 真实两遍：cmdbuf1 g2l+mm(rsafe=11)→读 P1 算 r_opt；cmdbuf2 fresh ctx 同 alloc 布局仅 mm(r_opt)→l2g P2（无 right 重载） | 11→r_opt=11 | 512/512 bad=0 |
+
+- **结论：bmk1822 支持同块不重载**。rshift_bits 是 TIU 指令字段（非权重编码），
+  matrix_multiplication 不修改输入 → 权重块在 pass1/pass2 间驻留复用安全。
+  该结论直接支撑引擎 cmdbuf 预建模板（pass1/pass2 共享 right 的 g2l，省一次带宽）。
+- Test A 同时复证 ④b（K=32/N=512 right=16KB + res 512B + left 32B alloc 成功）与 ④c
+  （标准 INT8 matmul 全 512 列正确，含饱和）。
+
+### 提交量口径备忘（CEO 要求标注两种 tiling）
+
+| tiling | submits/layer | submits/token | 依据 |
+|---|---|---|---|
+| KG=32 + N-tile=896（patha_kg32 P3 实测） | 640（6×56 + down 304） | **15,360** | REPORT_PATHA_KG32 §2.1 |
+| KG=32 + N-tile=512（设计默认，k/v 等窄矩阵仍 1 tile） | 2,064 | **≈49,500** | DESIGN_PATH_A_TWOPASS §2 |
+
+- 两口径均 SD-bound（TIU 183–200ms/token ≪ SD 9.2s），不影响 decode 上界；
+  引擎 spec 需固定实际 tiling 并自洽（如 N-tile=512 时 49.5k/token）。
