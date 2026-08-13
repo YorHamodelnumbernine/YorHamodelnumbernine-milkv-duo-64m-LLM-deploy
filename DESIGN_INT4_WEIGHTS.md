@@ -137,6 +137,24 @@ void int4_unpack(const uint8_t *src_nib, const float *src_scale,
   （nibble 拆分 + 移位 + 乘 scale）实现，但 CPU 解包更简单且已足够快。
   → 建议：CPU 解包，TPU 侧无需新算子。
 
+### 5.1 真实权重验证（2026-08-12，host，layer0.bin）
+
+工具：`convert_i4.c`（layerN.bin → layerN_i4.bin，复用 `int4_common.c` 同一套
+pack/unpack）。用设备上的真实 `layer0.bin`（3,543,552 B，md5 41a3b489…）验证：
+
+| 项 | 结果 |
+|---|---|
+| 7 矩阵 packed 字节 | **1,880,064 B**（=1,769,472 nibble + 110,592 fp16 scale）✓ |
+| 层总字节（含 rms f32） | **1,884,672 B**（较 INT8 3,543,552 B 省 47%）✓ |
+| rms_attn / rms_ffn 透传 | 完全一致 ✓ |
+| round-trip max_err | 9（全 7 矩阵）|
+| round-trip RMS | 3.2 – 4.2（Wq 3.2 / Wk 3.3 / Wv 3.6 / Wo 3.2 / up 4.2 / gate 4.2 / down 3.8）|
+
+> 说明：真实权重是满幅 per-channel INT8（值域近 ±127），组内动态范围大，
+> G=64 下每值重建 RMS ~3-4% 属预期；下游 matmul 输出误差会随 N 平均，
+> 实际 logits 扰动远小于权重 RMS。若验收 next_token 漂移，可退 G=32（scale 开销
+> 升至 12.5%）或 INT4/INT8 混合（敏感矩阵保 INT8）。
+
 ---
 
 ## 6. 验收口径（上板后）
@@ -144,3 +162,51 @@ void int4_unpack(const uint8_t *src_nib, const float *src_scale,
 - 正确性：next_token=5021、tokens 序列合理、EXIT=0。
 - 性能：Wt load 3.4s → ≤1.7s；decode/tok 相应下降。
 - 记录前后数据回报 CEO，不提交 git。
+
+---
+
+## 7. 最终结论（2026-08-13）：INT4 压缩路线判负 + convert bug 修正记录
+
+**状态：实现并上板验证 → 质量不达标，正式搁置。生产路径维持 INT8。**
+
+### 7.1 重要：convert_i4.c 布局 bug（先修后验）
+
+设备端独立校验发现，首版 `layerN_i4.bin` 的 FFN 3 矩阵全部错位 **2304 字节**。
+根因：convert 连续读取 7 个矩阵，但源 `layerN.bin` 布局在 `Wo` 与 `ffn_up` 之间
+内嵌 `rms_ffn`（f32,2304B），导致第 4 个矩阵把 `[rms_ffn + ffn_up[:882432]]` 当作
+`ffn_up` 打包，gate/down 依次错位；`rms_ffn` 被写到文件末尾而非中间。
+attn 4 矩阵不受影响（rms 3.2），FFN 全为垃圾（rms 55）。
+
+> ⚠️ **此前所有基于未修复 convert 的 INT4 质量结论（含 Design A 的 "next_token=45401 /
+> gap 0.3"）均建立在该 bug 上，作废。** 已修复（按 INT8 布局读写 rms_ffn），全部 30 层
+> 重新生成，设备端独立校验 FFN rms 降至 3-4。
+
+### 7.2 修正后回归数据（同一二进制、同一输入，3 轮）
+
+| 配置 | next_token | top 间隙 | Wt load | Total | 文件/层 |
+|---|---|---|---|---|---|
+| INT8 基线 | 5021 ✓ | 5.8 | 3741 ms | 42106 ms | 3,543,552 B |
+| full-INT4 G64 | 3625（5021 为 #3 候选）| 3.4→0.6 塌缩 | 1283 ms | 26906 ms (−36%) | 1,884,672 B (−47%) |
+| FFN-only G64 | 6271 ✗ | 4.2（后步）| 2212 ms | 31943 ms (−24%) | 2,299,392 B (−35%) |
+| FFN-only G16 | 34346 ✗ | 2.4–2.7 | 3694 ms | 43299 ms (+3%) | 2,548,224 B (−28%) |
+
+### 7.3 判负结论与根因
+
+1. **FFN-only 判负**：G=16（计划内最小分组、误差最低）仍 next_token=34346≠5021、
+   gap 2.4<3，且 G16 的 scale 开销使字节节省缩水到 28%，Wt load 无收益（+3% 劣化）。
+2. **full-INT4 修正后仍判负**：有效权重下并非灾难性崩塌（5021 进入首步 top-3、gap 3.4），
+   但后续 decode 仍塌缩（gap 0.6）、next_token=3625≠5021。
+3. **根因（理论印证）**：per-channel INT8 权重已满幅（std 30-38），组 INT4 量化步长
+   ≈max/7≈18，对 FFN 输出扰动过大；G 64→16 仅把误差 4.2→3.2，仍不足以稳定 next_token=5021。
+   INT4 量化噪声在该模型（INT8 基线 gap 仅 5.8，本已边缘）上不可接受。
+4. 生产路径 INT8 未受影响（next_token=5021 ✓ 验证），WT_INT4 开关保留但默认关闭。
+
+### 7.4 对未来的启示
+
+- **per-channel INT8 满幅权重 → 组 INT4 二次量化不可行**（无局部可压缩结构）。
+  若要 INT4，需从原始 fp32 权重出发 + calibration/更细激活量化，且须先验证单层
+  logit 扰动而非仅权重 RMS。
+- **host 转换工具与设备端需交叉校验**：布局/尺寸语义（内嵌 rms_ffn 这类"段间非矩阵
+  数据"）是易错点，转换器应按源布局结构逐段读写，而非连续矩阵扫描。
+- Wt load 的压缩路径封死后，SD 读取（21.9MB/s 物理上限 + 101MB/token 刚性）已近
+  理论最优（3.7s vs 理想 5.6s 的预取重叠），后续收益仅来自驻留缓存等边际优化。

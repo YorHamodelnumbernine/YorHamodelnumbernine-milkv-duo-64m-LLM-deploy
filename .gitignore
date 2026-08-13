@@ -31,6 +31,18 @@ transformer_demo
 transp_diag
 transp_size_test
 
+# INT4 experiment binaries (rejected quality path, source kept)
+convert_i4
+convert_i4_dev
+i4_dbg
+i4_op_test
+int4_bench
+int4_proto
+smollm2_pool_b2_i4
+
+# Personal dev helper (not part of the project)
+duo_dev.py
+
 # Subdirectory: ignore compiled binaries, keep *.c source
 01_conv/*
 !01_conv/*.c
