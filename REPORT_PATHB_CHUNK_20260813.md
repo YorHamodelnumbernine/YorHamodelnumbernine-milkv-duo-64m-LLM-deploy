@@ -80,6 +80,12 @@ CEO 交办的 ps32-free 出口（**per-chunk INT8 matmul 多 submit + 自适应 
   per-chunk 串行 116ms/layer、run-only 35.8ms/layer 均 ≪ 680ms → **完全可被 SD 读掩盖**。
   → **decode 上界（SD 受限 ~16.3s/token）不受 per-chunk 提交量影响**（与 REPORT_PS32 §7 结论一致）。
 
+> **decode 口径校准（2026-08-13 CEO 定稿）**：本节 **16.3s/token 为 Path B 权重口径**
+> （358MB/token，per-ch INT8 直存）。A' 侧（201.4MB 权重 + 136.1MB LM head embed = 337MB/token）：
+> 337/21.9 ≈ **15.4s/token**（实测保守，**门禁用此值**）、337/29 ≈ **11.6s/token**（设计乐观）。
+> 标注「SD 流式上界 [11.6, 15.4]s/token，门禁取 15.4s（实测）」。带宽依据：上板实测 21.9MB/s，
+> 29MB/s 为设计估值（REPORT_WS_DQ_VETO §6.4）。
+
 ### 2.3 对比当前 INT8 全 K 基线
 
 | 矩阵 | 全 K 基线（rshift=12） | per-chunk 2-pass | 倍率 | 说明 |
