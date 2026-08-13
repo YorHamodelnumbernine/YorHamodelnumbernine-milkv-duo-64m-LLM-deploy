@@ -1,6 +1,6 @@
-# Path A 两遍法闸口签核 — 上板实证（Gate ① pass1 int8 回读 + Gate ④b N-tile）
+# Path A 两遍法闸口签核 — 上板实证（Gate ①②③④a/④b/④c 合并记录）
 
-日期：2026-08-13 | 作者：TPU 底层工程师 | 状态：**已签核，上板实测** | 关联：`gate_a_check.c`
+日期：2026-08-13 | 作者：TPU 底层工程师 | 状态：**已签核，上板实测（CEO 四项闸口核对验收通过）** | 关联：`gate_a_check.c`、`rs_noreload_check.c`、`gate1_mrow_check.c`
 
 ---
 
@@ -10,10 +10,22 @@
   `res_is_int8=1`）+ `tdma_l2g_matrix_copy` + `MemInvld` 回读，在
   K=32/128、N=192、rshift=8/5 下 **全部逐元素精确**（bad=0）。
   含饱和场景（rshift=5，部分值 sat8 到 ±127）仍确定可复现。
+- **Gate ②（提交量 / 批量成本）确认通过**：批量 per-op 成本 **3.7μs**（PS32 probe21：
+  build ~1.9μs + run ~1.8μs，192/192 正确，cmdbuf ~2000 op/256KB）。A' 实际 tiling
+  15,360/token ≈ 57ms/token、保守 per-group 80,544/token ≈ 0.30s/token，对 SD 9.18s/token
+  余量 ≥30×（CEO 核对 ≥34×）。**build 摊销为硬前提**：naive per-submit 0.55ms 不可接受，
+  必须预建 cmdbuf（详见 §6 提交量口径）。
+- **Gate ③（ION/LMEM）无冲突**：ION 布局 A ≈18.9MB < 24MB（余 ~5.1MB）；lmem 界
+  KG=32→N≤896（28KB）/ KG=128→N≤224，两遍法 tiling 自由，无 TIU 硬件上限。
+- **Gate ④a（同块不重载）签核通过**：pass1(rsafe)/pass2(r_opt) 同一 LMEM 权重块、仅
+  rshift_bits 不同、**无 right g2l 重载**，`rs_noreload_check.c` Test A/B 512/512 bad=0
+  （pass2 含 408 个 sat8 值仍精确）。
 - **Gate ④b（N-tile=512）签核通过**：标准 INT8 两遍法**不受 ps32 N=192
   硬件上限约束**，仅受 lmem 容量约束。K=32 下 **N=512 实测 512/512 正确**
   （right[32,512]=16KB）；K=32 最大 N=896（28KB，N=1024 因对齐越界 alloc fail）。
   KG=128 下最大 N=192（right[128,192]=24KB）。
+- **Gate ④c（全 N 列）签核通过**：标准 INT8 matmul 全 N 列逐元素正确（含饱和）——
+  K=32/N=512 全 512 列、K=32/N=896 全 896 列（patha_kg32 P0 生产形状 5/5 bad=0）。
 - **TIU 舍入语义补订（含小 rshift + 负数，CEO 追问项）**：INT8 matmul
   rshift>0 时为 **round-half-up**（11440>>8 → 45，非截断 44），**对所有
   rshift=1..4、含负数半值均成立**（`rshift_check.c` 上板：6 组 bad=0，
@@ -121,12 +133,30 @@ r_opt 精化、pass2 重算，全部 bmk1822 标准 INT8 matmul（ps32-free, res
 16KB + left 1KB = 33KB 超限 → prefill 大 M 需按 M 或 N 切 tile（如 M=16/N=512 或
 M=32/N=256）。无 TIU 侧新限制（标准 INT8 matmul 不受 ps32 N=192 上限约束）。
 
-### 提交量口径备忘（CEO 要求标注两种 tiling）
+## 6. ② 提交量口径（CEO 要求合并标注，三个数字勿混用）
 
-| tiling | submits/layer | submits/token | 依据 |
-|---|---|---|---|
-| KG=32 + N-tile=896（patha_kg32 P3 实测） | 640（6×56 + down 304） | **15,360** | REPORT_PATHA_KG32 §2.1 |
-| KG=32 + N-tile=512（设计默认，k/v 等窄矩阵仍 1 tile） | 2,064 | **≈49,500** | DESIGN_PATH_A_TWOPASS §2 |
+**批量 per-op 成本（PS32 probe21，N=192 forced-c1）**：build ~1.9μs + run ~1.8μs
+≈ **3.7μs/op**，192/192 正确；cmdbuf 容量 ~2000 op/256KB。**build 摊销为硬前提**——
+naive per-submit（register+alloc+convert+load+Run）0.55ms/submit 不可接受
+（REPORT_PATHA_KG32 §2.2）；预建 cmdbuf 后 Run+Invld 0.14ms、完整两遍法
+0.44ms/block → C 流水 ≈3.4s/token < SD 9.18s（REPORT_SUBMIT_BUDGET §1）。
 
-- 两口径均 SD-bound（TIU 183–200ms/token ≪ SD 9.2s），不影响 decode 上界；
-  引擎 spec 需固定实际 tiling 并自洽（如 N-tile=512 时 49.5k/token）。
+| tiling 口径 | submits/layer | submits/token | 批量成本 @3.7μs/op | 依据 |
+|---|---|---|---|---|
+| **A' 实际**：KG=32 + N-tile=896（patha_kg32 P3 实测，k/v 1 tile、up/gate 6 tile） | 640（6×56 + down 304） | **15,360** | ~57ms/token（余量 ~160×） | REPORT_PATHA_KG32 §2.1 |
+| 设计默认：KG=32 + N-tile=512（k/v 等窄矩阵仍 1 tile） | 2,064 | **≈49,500** | ~183ms/token（余量 ~50×） | DESIGN_PATH_A_TWOPASS §2 |
+| 保守：G=32 + N-chunk=192（PS32 per-group 口径，**含 lm_head**） | — | **80,544** | ~0.30s/token（余量 ≥30×，CEO ≥34×） | PS32_PER_GROUP_VERDICT §3 |
+
+- **三口径均 SD-bound**：批量成本 0.06–0.30s/token ≪ SD 9.18s/token，不影响 decode 上界。
+- **勿混用**：三个数字对应不同 tiling（N-tile=896 / 512 / 192 及是否含 lm_head）。
+  引擎 spec 必须固定实际 tiling 并自洽；引用时必须带 tiling 前缀（如"N-tile=896 时 15,360/token"）。
+
+## 7. 合并与验收记录（CEO 裁定 2026-08-13）
+
+四项闸口核对验收通过，本记录为合并版（Gate ①②③④a/④b/④c）：
+- **② 提交量正式确认**：批量 3.7μs/op，余量 ≥34×，build 摊销为硬前提（并入引擎 IMPL spec）。
+- **④a 同块不重载新验证通过**：`rs_noreload_check.c` Test A/B 512/512 bad=0，
+  rshift 变更无 g2l 重载（并入引擎 IMPL spec）。
+- **④b N-tile=512 签核**（K=32 上限 N=896）、**④c 全 N 列签核**（含饱和）。
+- **③ ION/LMEM 无冲突**：ION 布局 A 18.9MB < 24MB；lmem 界见 §2/§0。
+- **提交量口径**：见 §6 三口径表，勿混用。
