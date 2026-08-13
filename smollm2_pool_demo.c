@@ -16,6 +16,7 @@
 #include "common/tpu_bench.h"
 #include "common/mha_descriptor.h"
 #include "common/rtos_cmdqu.h"
+#include "int4_common.h"
 #include <math.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -408,6 +409,125 @@ static int tpu_matmul_build(tpu_ctx *ctx, cvk_context_t *cvk,
  * ================================================================ */
 static inline int sm_layer_bytes(int D, int dkv, int F) {
     return D*4 + D*D + D*dkv + D*dkv + D*D + D*4 + D*F + D*F + F*D;
+}
+
+/* ================================================================
+ *  INT4 weight loading (Design A) — SD-side INT4, ION stays INT8.
+ *
+ *  WT_INT4=1 switches the four layer-load paths (pf_worker / init
+ *  layers / first-batch sync / fallback) to read layer%d_i4.bin
+ *  (G=64 fp16 scales) and unpack fixed-point into the SAME INT8 ION
+ *  slot layout.  ION slot size (layer_sz) is unchanged.
+ *
+ *  Scalar 30-layer unpack ~2120ms; RVV int4_unpack_fixed_rvv ~254ms
+ *  and is hidden behind SD reads in the double-buffer pipeline.
+ * ================================================================ */
+static int g_wt_i4 = 0;          /* runtime switch (WT_INT4 env) — full-layer INT4 (EXP, known degraded) */
+static int g_wt_ffn_i4 = 0;      /* runtime switch (WT_FFN_I4 env) — FFN-only INT4 (CEO Direction-2) */
+static int g_D = 576, g_dkv = 192, g_F = 1536, g_G = 64;
+static uint8_t g_i4_scratch[640 * 1024] __attribute__((aligned(64))); /* D*F: nib 442KB + sc(G=16) 110KB < 640KB */
+
+static int read_full_fd(int fd, void *buf, size_t n) {
+    size_t got = 0; uint8_t *p = (uint8_t *)buf;
+    while (got < n) {
+        int r = read(fd, p + got, n - got);
+        if (r <= 0) return -1;
+        got += r;
+    }
+    return 0;
+}
+
+/* Unpack layer%d_i4.bin into dst (INT8 layout, layer_sz bytes).
+ * scratch budget: largest matrix D*F -> nib 442KB + sc 27KB < 512KB. */
+static int sm_load_layer_i4(const char *dir, int layer, int D, int dkv, int F,
+                            uint8_t *dst) {
+    const int G = 64;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/layer%d_i4.bin", dir, layer);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "  i4: open %s fail\n", path); return -1; }
+    uint8_t *scratch = g_i4_scratch;
+
+    if (read_full_fd(fd, dst, (size_t)D * 4) != 0) { close(fd); return -1; } /* rms_attn */
+    uint8_t *w = dst + (size_t)D * 4;
+
+    /* attn mats: Wq D*D, Wk D*dkv, Wv D*dkv, Wo D*D */
+    const int a_rows[4] = { D, D, D, D };
+    const int a_cols[4] = { D, dkv, dkv, D };
+    for (int m = 0; m < 4; m++) {
+        int n = a_rows[m] * a_cols[m];
+        int nib = n / 2, sc = (n / G) * 2;
+        if (read_full_fd(fd, scratch, nib) != 0 ||
+            read_full_fd(fd, scratch + nib, sc) != 0) { close(fd); return -1; }
+        int16_t *scf = (int16_t *)(scratch + nib);
+        for (int g = 0; g < n / G; g++) {
+            uint16_t h; memcpy(&h, scratch + nib + (size_t)g * 2, 2);
+            scf[g] = (int16_t)lrintf(fp16_to_float(h) * 256.0f);
+        }
+        int4_unpack_fixed_rvv(scratch, scf, n, G, w);
+        w += n;
+    }
+
+    if (read_full_fd(fd, w, (size_t)D * 4) != 0) { close(fd); return -1; } /* rms_ffn */
+    w += (size_t)D * 4;
+
+    /* ffn mats: up D*F, gate D*F, down F*D */
+    const int f_rows[3] = { D, D, F };
+    const int f_cols[3] = { F, F, D };
+    for (int m = 0; m < 3; m++) {
+        int n = f_rows[m] * f_cols[m];
+        int nib = n / 2, sc = (n / G) * 2;
+        if (read_full_fd(fd, scratch, nib) != 0 ||
+            read_full_fd(fd, scratch + nib, sc) != 0) { close(fd); return -1; }
+        int16_t *scf = (int16_t *)(scratch + nib);
+        for (int g = 0; g < n / G; g++) {
+            uint16_t h; memcpy(&h, scratch + nib + (size_t)g * 2, 2);
+            scf[g] = (int16_t)lrintf(fp16_to_float(h) * 256.0f);
+        }
+        int4_unpack_fixed_rvv(scratch, scf, n, G, w);
+        w += n;
+    }
+
+    close(fd);
+    return 0;
+}
+
+/* FFN-only INT4 (CEO Direction-2): attn 4 mats + rms f32 pass through INT8
+ * unchanged; only ffn_up/gate/down are INT4 (G=fp16, group g_G).  Reads
+ * layer%d_ffni4.bin (G=64: 2,299,392 B/layer, -35% vs INT8).  dst = INT8 slot. */
+static int sm_load_layer_ffni4(const char *dir, int layer, int D, int dkv, int F,
+                               uint8_t *dst) {
+    const int G = g_G;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/layer%d_ffni4.bin", dir, layer);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "  i4: open %s fail\n", path); return -1; }
+    uint8_t *scratch = g_i4_scratch;
+
+    /* passthrough: rms_attn + Wq/Wk/Wv/Wo + rms_ffn = 2*D*4 + D*D + 2*D*dkv + D*D */
+    int pass_sz = 2 * D * 4 + D * D + 2 * D * dkv + D * D;
+    if (read_full_fd(fd, dst, pass_sz) != 0) { close(fd); return -1; }
+    uint8_t *w = dst + pass_sz;
+
+    /* FFN mats: up D*F, gate D*F, down F*D — i4 */
+    const int f_rows[3] = { D, D, F };
+    const int f_cols[3] = { F, F, D };
+    for (int m = 0; m < 3; m++) {
+        int n = f_rows[m] * f_cols[m];
+        int nib = n / 2, sc = (n / G) * 2;
+        if (read_full_fd(fd, scratch, nib) != 0 ||
+            read_full_fd(fd, scratch + nib, sc) != 0) { close(fd); return -1; }
+        int16_t *scf = (int16_t *)(scratch + nib);
+        for (int g = 0; g < n / G; g++) {
+            uint16_t h; memcpy(&h, scratch + nib + (size_t)g * 2, 2);
+            scf[g] = (int16_t)lrintf(fp16_to_float(h) * 256.0f);
+        }
+        int4_unpack_fixed_rvv(scratch, scf, n, G, w);
+        w += n;
+    }
+
+    close(fd);
+    return 0;
 }
 
 typedef struct {
@@ -821,6 +941,18 @@ static void *pf_worker(void *arg) {
     int ok = 1;
 
     for (int i = 0; i < j->n; i++) {
+        if (g_wt_ffn_i4) {
+            if (sm_load_layer_ffni4(j->weight_dir, j->layer_id + i,
+                                    g_D, g_dkv, g_F,
+                                    j->buf + (size_t)i * j->sz) != 0) { ok = 0; break; }
+            continue;
+        }
+        if (g_wt_i4) {
+            if (sm_load_layer_i4(j->weight_dir, j->layer_id + i,
+                                 g_D, g_dkv, g_F,
+                                 j->buf + (size_t)i * j->sz) != 0) { ok = 0; break; }
+            continue;
+        }
         char path[256];
         snprintf(path, sizeof(path), "%s/layer%d.bin",
                  j->weight_dir, j->layer_id + i);
@@ -1353,11 +1485,27 @@ static int pool_load_embed_and_init_layers(pool_t *p) {
     int n_init = 3;
     if (n_init > p->ion_n_slots) n_init = p->ion_n_slots;
     for (int i = 0; i < n_init; i++) {
+        uint8_t *dst = p->ion_vaddr + i * p->layer_sz;
+        if (g_wt_ffn_i4) {
+            if (sm_load_layer_ffni4(p->weight_dir, i, p->D, p->dkv, p->F, dst) != 0) {
+                fprintf(stderr, "  POOL: layer%d_ffni4 load fail\n", i);
+                return -1;
+            }
+            p->ion_slot_layer[i] = i;
+            continue;
+        }
+        if (g_wt_i4) {
+            if (sm_load_layer_i4(p->weight_dir, i, p->D, p->dkv, p->F, dst) != 0) {
+                fprintf(stderr, "  POOL: layer%d_i4 load fail\n", i);
+                return -1;
+            }
+            p->ion_slot_layer[i] = i;
+            continue;
+        }
         snprintf(path, sizeof(path), "%s/layer%d.bin", p->weight_dir, i);
         int fd = open(path, O_RDONLY);
         if (fd < 0) { fprintf(stderr, "  POOL: open layer%d fail\n", i); return -1; }
         int remain = p->layer_sz;
-        uint8_t *dst = p->ion_vaddr + i * p->layer_sz;
         while (remain > 0) {
             int n = (remain < 262144) ? remain : 262144;
             if (read(fd, buf, n) != n) {
@@ -1607,11 +1755,23 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
         /* ---- Load first batch (layers 0-2) into Bank A (sync) ---- */
         ts = TICK();
         for (int i = 0; i < batch_slots; i++) {
+            uint8_t *dst = ion_va + (bank_a + i) * layer_sz;
+            if (g_wt_ffn_i4) {
+                if (sm_load_layer_ffni4(weight_dir, i, D, pool->dkv, pool->F, dst) != 0) {
+                    use_pipeline = 0; break;
+                }
+                continue;
+            }
+            if (g_wt_i4) {
+                if (sm_load_layer_i4(weight_dir, i, D, pool->dkv, pool->F, dst) != 0) {
+                    use_pipeline = 0; break;
+                }
+                continue;
+            }
             char lpath[256];
             snprintf(lpath, sizeof(lpath), "%s/layer%d.bin", weight_dir, i);
             int fd = open(lpath, O_RDONLY);
             if (fd < 0) { use_pipeline = 0; break; }
-            uint8_t *dst = ion_va + (bank_a + i) * layer_sz;
             int remain = layer_sz;
             while (remain > 0) {
                 int n = (remain < 262144) ? remain : 262144;
@@ -1700,18 +1860,28 @@ fallback:
         /* Fallback: single ION slot, serial SD read + TPU */
         for (int i = 0; i < L; i++) {
             ts = TICK();
-            char lpath[256];
-            snprintf(lpath, sizeof(lpath), "%s/layer%d.bin", weight_dir, i);
-            int fd = open(lpath, O_RDONLY);
-            if (fd < 0) { free(x); return -1; }
-            int remain = layer_sz;
-            uint8_t *dst = ion_va;
-            while (remain > 0) {
-                int n = (remain < 262144) ? remain : 262144;
-                if (read(fd, io_buf, n) != n) { close(fd); free(x); return -1; }
-                memcpy(dst, io_buf, n); dst += n; remain -= n;
+            if (g_wt_ffn_i4) {
+                if (sm_load_layer_ffni4(weight_dir, i, D, pool->dkv, pool->F, ion_va) != 0) {
+                    free(x); return -1;
+                }
+            } else if (g_wt_i4) {
+                if (sm_load_layer_i4(weight_dir, i, D, pool->dkv, pool->F, ion_va) != 0) {
+                    free(x); return -1;
+                }
+            } else {
+                char lpath[256];
+                snprintf(lpath, sizeof(lpath), "%s/layer%d.bin", weight_dir, i);
+                int fd = open(lpath, O_RDONLY);
+                if (fd < 0) { free(x); return -1; }
+                int remain = layer_sz;
+                uint8_t *dst = ion_va;
+                while (remain > 0) {
+                    int n = (remain < 262144) ? remain : 262144;
+                    if (read(fd, io_buf, n) != n) { close(fd); free(x); return -1; }
+                    memcpy(dst, io_buf, n); dst += n; remain -= n;
+                }
+                close(fd);
             }
-            close(fd);
             CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
             t->t_weight_load += TICK() - ts;
 
@@ -2057,6 +2227,18 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR: cannot read config.bin\n"); return 1;
     }
     int D=c.D, d=c.head_dim, F=c.FFN, V=c.V, max_seq=c.max_seq;
+    /* WT_INT4: full-layer Design A INT4 (EXP, known-degraded).  WT_FFN_I4:
+     * FFN-only INT4 (CEO Direction-2, attn stays INT8).  Both default 0. */
+    { const char *wi = getenv("WT_INT4");
+      if (wi && atoi(wi) > 0) { g_wt_i4 = 1; }
+      const char *wf = getenv("WT_FFN_I4");
+      if (wf && atoi(wf) > 0) { g_wt_ffn_i4 = 1; }
+      const char *wg = getenv("WT_FFN_G");
+      if (wg && atoi(wg) >= 16) { g_G = atoi(wg); }
+      fprintf(stderr, "[Init] WT_INT4=%d WT_FFN_I4=%d FFN_G=%d (INT8 layer_sz=%d B, "
+              "full-i4=layer*_i4.bin, ffn-i4=layer*_ffni4.bin)\n",
+              g_wt_i4, g_wt_ffn_i4, g_G, sm_layer_bytes(D, c.d_qkv, F)); }
+    g_D = D; g_dkv = c.d_qkv; g_F = F;
     /* SM_MAX_SEQ: optional env override to raise max_seq (INT8 KV long-context test). */
     { const char *ms = getenv("SM_MAX_SEQ");
       if (ms && atoi(ms) > 0) { max_seq = atoi(ms); c.max_seq = max_seq;

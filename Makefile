@@ -47,6 +47,14 @@ gen_rand_weights: gen_rand_weights.c
 smollm2_demo: smollm2_demo.c common/tpu_bench.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
+# smollm2_pool_demo: INT8 default + WT_INT4=1 runtime switch (Design A)
+smollm2_pool_demo: smollm2_pool_demo.c common/tpu_bench.h int4_common.c int4_common.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ smollm2_pool_demo.c int4_common.c
+
+# smollm2_pool_b2_i4: alias binary for CEO regression command
+smollm2_pool_b2_i4: smollm2_pool_demo.c common/tpu_bench.h int4_common.c int4_common.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ smollm2_pool_demo.c int4_common.c
+
 %: %.c common/tpu_bench.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
