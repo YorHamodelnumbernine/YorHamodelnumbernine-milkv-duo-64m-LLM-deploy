@@ -92,6 +92,35 @@ Path A 两遍法设计的 ④a 要求：pass1(rsafe) 与 pass2(r_opt) 用**同�
 - Test A 同时复证 ④b（K=32/N=512 right=16KB + res 512B + left 32B alloc 成功）与 ④c
   （标准 INT8 matmul 全 512 列正确，含饱和）。
 
+## 5b. 补充签核（2026-08-13，CEO 闸口①复核 → 新增 M>1 两遍法上板验证）
+
+CEO 闸口①复核要求匹配 `qwen_kal_ref.c::chunk_matmul_twopass` 语义（M>1 行）的
+轻量上板测试。新增 `gate1_mrow_check.c`：完全复刻参考实现的 rsafe 公式
+（`matmul_rshift_w(32,wmax)-3`，clamp≥4）、pass1 int8 回读取 per-chunk max、
+r_opt 精化、pass2 重算，全部 bmk1822 标准 INT8 matmul（ps32-free, res_is_int8=1）。
+
+**重要布局结论**：必须用**线性 FORCED 布局** `{n,c=1,w=全宽,col=全宽}`（同
+`gate_a_check`），不能用 `bmk1822_matrix_lmem_default_shape`（其返回 c-split
+布局如 `r{n=32,c=8,w=64,col=512}`，bmk1822 `l2g_matrix_copy` 无法正确解交织，
+实测全错）。线性布局 + l2g_matrix_copy 是唯一已验证的回读路径。
+
+| M | K | N | lmem(线性) | P1 bad | maxabs | r_opt | P2 bad | sat8 | 判定 |
+|---|---|---|---|---|---|---|---|---|---|
+| 16 | 32 | 512 | 25088 | **0/8192** | 128* | 10 | **0/8192** | 0 | ✓ ④b N=512+M>1 |
+| 32 | 32 | 256 | 17408 | **0/8192** | 128* | 10 | **0/8192** | 0 | ✓ 更大 M |
+| 64 | 32 | 128 | 14336 | **0/8192** | 127 | 9 | **0/8192** | 2 | ✓ MAX_SEQ=64 |
+| 1  | 32 | 512 | 16928 | **0/512** | 107 | 9 | **0/512** | 0 | ✓ ④b decode 复核 |
+
+\* maxabs=128 表示 pass1 实测含 -128（rsafe=9 在 |x|,|w|≤100 最坏数据下饱和），
+回读仍逐元素精确 → 复证"饱和路径确定性"（同 §1 rshift=5 结论）。r_opt 由
+`est=maxabs<<rsafe` 求出（M=16/32 时 est=65536→r_opt=10），P2 仍 0 bad。
+数值累加路径 `p2*(1<<r_opt)*gsc[n]*sc_row[m]` 与 fp64 参考最大偏差 ~1.8e-06（fp32 舍入级）。
+
+**对引擎的 ④b 设计输入（M>1 时的 lmem 预算）**：N-tile=512 在 M=1（decode，
+16.5KB）与 M=16（24.5KB）均可容纳；M=32 时 [32,32]×[32,512] 需 res 16KB + right
+16KB + left 1KB = 33KB 超限 → prefill 大 M 需按 M 或 N 切 tile（如 M=16/N=512 或
+M=32/N=256）。无 TIU 侧新限制（标准 INT8 matmul 不受 ps32 N=192 上限约束）。
+
 ### 提交量口径备忘（CEO 要求标注两种 tiling）
 
 | tiling | submits/layer | submits/token | 依据 |

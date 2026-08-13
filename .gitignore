@@ -53,6 +53,7 @@ patha_kg32_check
 pathb_chunk_probe
 rs_noreload_check
 rshift_check
+gate1_mrow_check
 
 # Personal dev helper (not part of the project)
 duo_dev.py
