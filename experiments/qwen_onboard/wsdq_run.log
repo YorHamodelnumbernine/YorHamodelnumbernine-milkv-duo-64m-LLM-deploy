@@ -1,0 +1,37 @@
+[wsdq] building kal_nat (layout=kal, lsc=nat)...
+[kal_nat/exact] '中国的首都是' next=2130 ref=2130 OK gap=1.420
+[kal_nat/exact] 'The capital of France is' next=12095 ref=12095 OK gap=0.933
+[kal_nat/exact] '今天天气很好，我们去公园' next=99366 ref=99366 OK gap=0.563
+[kal_nat/exact] ============ VERDICT 3/3 ============
+[kal_nat/twopass128] '中国的首都是' next=2130 ref=2130 OK gap=1.534
+[kal_nat/twopass128] 'The capital of France is' next=12095 ref=12095 OK gap=1.623
+[kal_nat/twopass128] '今天天气很好，我们去公园' next=99366 ref=99366 OK gap=0.799
+[kal_nat/twopass128] ============ VERDICT 3/3 ============
+[wsdq] building kal_bf16lsc (layout=kal, lsc=bf16)...
+[kal_bf16lsc/exact] '中国的首都是' next=2130 ref=2130 OK gap=0.784
+[kal_bf16lsc/exact] 'The capital of France is' next=12095 ref=12095 OK gap=1.245
+[kal_bf16lsc/exact] '今天天气很好，我们去公园' next=99366 ref=99366 OK gap=0.574
+[kal_bf16lsc/exact] ============ VERDICT 3/3 ============
+[kal_bf16lsc/twopass128] '中国的首都是' next=2130 ref=2130 OK gap=1.546
+[kal_bf16lsc/twopass128] 'The capital of France is' next=12095 ref=12095 OK gap=1.264
+[kal_bf16lsc/twopass128] '今天天气很好，我们去公园' next=99366 ref=99366 OK gap=0.877
+[kal_bf16lsc/twopass128] ============ VERDICT 3/3 ============
+[wsdq] building flat_nat (layout=flat, lsc=nat)...
+[flat_nat/exact] '中国的首都是' next=86140 ref=2130 MISMATCH gap=0.041
+[flat_nat/exact] 'The capital of France is' next=40400 ref=12095 MISMATCH gap=0.028
+[flat_nat/exact] '今天天气很好，我们去公园' next=18493 ref=99366 MISMATCH gap=1.162
+[flat_nat/exact] ============ VERDICT 0/3 ============
+[flat_nat/twopass128] '中国的首都是' next=71734 ref=2130 MISMATCH gap=0.415
+[flat_nat/twopass128] 'The capital of France is' next=40400 ref=12095 MISMATCH gap=0.136
+[flat_nat/twopass128] '今天天气很好，我们去公园' next=9370 ref=99366 MISMATCH gap=0.264
+[flat_nat/twopass128] ============ VERDICT 0/3 ============
+[wsdq] building flat_bf16lsc (layout=flat, lsc=bf16)...
+[flat_bf16lsc/exact] '中国的首都是' next=86809 ref=2130 MISMATCH gap=0.198
+[flat_bf16lsc/exact] 'The capital of France is' next=80874 ref=12095 MISMATCH gap=1.712
+[flat_bf16lsc/exact] '今天天气很好，我们去公园' next=26288 ref=99366 MISMATCH gap=3.502
+[flat_bf16lsc/exact] ============ VERDICT 0/3 ============
+[flat_bf16lsc/twopass128] '中国的首都是' next=85782 ref=2130 MISMATCH gap=0.292
+[flat_bf16lsc/twopass128] 'The capital of France is' next=80874 ref=12095 MISMATCH gap=0.252
+[flat_bf16lsc/twopass128] '今天天气很好，我们去公园' next=26288 ref=99366 MISMATCH gap=1.537
+[flat_bf16lsc/twopass128] ============ VERDICT 0/3 ============
+[wsdq] wrote wsdq_ref.json
