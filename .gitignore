@@ -46,6 +46,11 @@ ps32_probe*
 !ps32_probe*.c
 ps32_dec_spike
 
+# Path A gate / rounding probes (source kept)
+gate_a_check
+dbg_mm
+rshift_check
+
 # Personal dev helper (not part of the project)
 duo_dev.py
 

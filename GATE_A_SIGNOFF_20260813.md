@@ -14,9 +14,12 @@
   硬件上限约束**，仅受 lmem 容量约束。K=32 下 **N=512 实测 512/512 正确**
   （right[32,512]=16KB）；K=32 最大 N=896（28KB，N=1024 因对齐越界 alloc fail）。
   KG=128 下最大 N=192（right[128,192]=24KB）。
-- **TIU 舍入语义补订**：INT8 matmul rshift>0 时为 **round-half-up**
-  （11440>>8 → 45，非截断 44）。CPU 侧反量化必须匹配此语义，否则两遍法
-  pass2 结果会系统性偏差 1。
+- **TIU 舍入语义补订（含小 rshift + 负数，CEO 追问项）**：INT8 matmul
+  rshift>0 时为 **round-half-up**（11440>>8 → 45，非截断 44），**对所有
+  rshift=1..4、含负数半值均成立**（`rshift_check.c` 上板：6 组 bad=0，
+  负/正半值命中 32/38、17/16、4/8、5/2、6/10、4/3）。即 signed 值向 +∞ 舍入：
+  `out = sat8((acc + (1<<(rshift-1))) >> rshift)`。CPU 侧反量化必须匹配此语义，
+  否则两遍法 pass2 结果系统性偏差 1。
 
 ## 1. Gate ①：pass1 int8 回读（ps32-free 标准 INT8 matmul + rshift）
 
@@ -69,3 +72,4 @@
 
 - `gate_a_check.c`（本次闸口探针：Gate ① 三组 + Gate ④b 九组宽度扫描）
 - `dbg_mm.c`（已知数据调试件，确定 round-half-up 语义：11440>>8→45）
+- `rshift_check.c`（小 rshift + 负数半值确认探针：rshift=1..4、K=32/128，6 组 bad=0）
