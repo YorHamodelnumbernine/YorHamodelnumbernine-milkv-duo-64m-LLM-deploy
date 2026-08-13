@@ -169,3 +169,29 @@ python3 $HOME/Documents/MilkV_duo_project/duo_ssh.py "/tmp/<binary>"
 10. 发现 lookup_table 需要 table shape `{1, NPU_NUM=8, EU_NUM=16, table_n}`
 11. 发现 QDM 操作（mul_qdm, matmul_qdm）存在未文档化的量化参数格式问题
 12. 使用非 QDM API（element_wise_mac, matrix_multiplication）+ 软件后处理实现等效功能
+
+---
+
+## SmolLM2-135M 推理引擎最终状态（2026-08）
+
+在 TPU 微基准之上，项目完成了 SmolLM2-135M 双核推理引擎（`smollm2_pool_demo.c`，
+CV1800B：C906B@1GHz + C906L@700MHz FreeRTOS + ION 24MB 双缓冲流水线）。
+
+**最终性能（精确命令 3 轮中位，next_token=5021，EXIT=0）**
+- Total ~41,800 ms（36 in / 4 out）；decode ~4,900 ms/tok（初始 ~7,240）
+- LM_Head ~789 ms（初始 2,598，−70%）；Wt load ~3,700 ms（SD 21.9MB/s 物理上限）
+- 上下文 39 → 156+ tokens（INT8 KV，×4）
+
+**落地优化**
+1. 权重预取串行化（Change C，decode −10%）
+2. LM_Head 副核转置重叠 + blocked 固件（BS=32，EMBED_XPOSE 100→26.6ms）
+3. DDR embed=2MB 默认（Total −11.7%、LM_Head −33%）
+4. INT8 KV cache（上下文 ×4，bit-exact）
+
+**判负/搁置**
+- INT4 权重（全量/FFN-only）：质量判负——per-channel INT8 满幅无可压缩结构；
+  工具保留，引擎钩子存于 `experiments/int4-weights` 分支
+- MLA：搁置（无 100M–1B MLA 模型，真杠杆为 INT8 KV）
+- fip_4096：构建归档未刷写（收益小）
+
+详见 `README.md`、`DESIGN_INT8_KV.md`、`DESIGN_INT4_WEIGHTS.md`、`MLA_DEPLOY_FEASIBILITY.md`。

@@ -215,28 +215,48 @@ with open("test_tokens.bin", "wb") as f:
         f.write(struct.pack("<i", t))
 ```
 
-## Performance (CV1800B, Jul 2026)
+## Performance (CV1800B, Aug 2026 — final)
 
-| Metric | Time | Notes |
-|--------|------|-------|
-| Prefill (6 tokens) | ~11,500 ms | Batch M=3 matmul |
-| Decode per token | ~11,950 ms | 30 layers × SD read + TPU |
-| LM Head (48 chunks) | ~4,600 ms | 33/48 chunks from ION cache |
-| Weight load per layer | ~170 ms | 3.38 MB SD→DDR→ION |
+Precise regression: `/root/smollm2_pool_demo <weights> <tokens.bin> 3 3 2`
 
-### Bottlenecks
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Prefill (36 tok) | ~22,200 ms | chunked prefill |
+| Decode per token | ~4,900 ms | 30 layers, dual-core pipelined |
+| LM Head | ~789 ms | DDR=2MB embed + async sec-core transpose overlap |
+| Weight load | ~3,700 ms | SD @ 21.9 MB/s (physical cap, near optimal) |
+| Total (36 in / 4 out) | ~41,800 ms | 3-round median, next_token=5021, EXIT=0 |
+| Context length | 39 → 156+ tokens | INT8 KV cache (×4) |
 
-1. **SD card bandwidth** (~2-3 MB/s): every layer (3.38 MB) re-read from SD each decode step.  30 layers × 200 ms ≈ 6 s.
-2. **LM Head**: ~15 embed chunks still require SD reads (embed is 28 MB, ION is 24 MB).
-3. **DDR→ION secondary core offload disabled**: `/proc/self/pagemap` unavailable → DDR physical addresses cannot be resolved → `CMD_MHA_DDR_TO_ION` never invoked.
-4. **ION slot count**: Only 2 layer slots fit after preserving embed cache (17.6 MB + 2 × 3.38 MB ≈ 24 MB).
+### Landed optimizations (Phase 3-4)
+
+1. **DDR embed=2MB default** (variant c): Total −11.7%, LM_Head −33% (1175→789 ms).
+2. **INT8 KV cache**: context 39→156+ tokens, bit-exact vs FP32 baseline, no perf regression.
+3. **Sec-core blocked transpose firmware** (BS=32, flashed): EMBED_XPOSE 100→26.6 ms.
+4. **LM_Head sec-core transpose overlap**: 2555→1830 ms (then →789 ms with DDR=2MB).
+5. **Weight prefetch serialization** (Change C): decode −10%.
+
+### Explored & rejected
+
+- **INT4 weights** (Design A): quality-gated — saturated per-channel INT8 leaves no compressible group structure; full-INT4 G64 and FFN-only G16/64 both fail next_token stability. Tools kept in `convert_i4.c` / `int4_common.*`; engine hook on `experiments/int4-weights` branch.
+- **MLA deployment**: rejected — no 100M–1B MLA model exists; the real context lever was INT8 KV.
+- **fip_4096**: built & archived (`fip_archive/`), not flashed (small gain, deferred).
+
+### Current bottlenecks
+
+1. **SD card bandwidth** (21.9 MB/s physical cap): 101 MB/token re-read ⇒ Wt load ~3.7 s is near theoretical optimum.
+2. **LM Head**: embed (28 MB) > ION (24 MB), partial chunk SD reads remain.
+3. **DDR→ION secondary-core offload disabled**: `/proc/self/pagemap` unavailable ⇒ DDR phys addrs unresolved.
 
 ### Optimization roadmap
 
-- [ ] Resolve DDR physical addresses (kernel patch for `CONFIG_PROC_PAGE_MONITOR` or `mmap` ION)
-- [ ] Pre-load embed SD-range chunks into DDR staging during the layer loop (hide SD latency)
-- [ ] Investigate SDIO access from secondary core (C906L)
-- [ ] Investigate TPU matmul tiling for larger M in prefill
+- [x] Serialize weight prefetch (Change C)
+- [x] LM_Head sec-core transpose overlap + blocked firmware
+- [x] DDR embed=2MB default
+- [x] INT8 KV cache (context ×4)
+- [ ] Resolve DDR physical addresses (kernel patch `CONFIG_PROC_PAGE_MONITOR` / ION mmap)
+- [ ] Hot-layer weight residency in DDR/ION (cut per-token SD traffic)
+- [ ] SDIO access from secondary core (C906L)
 
 ## License
 
