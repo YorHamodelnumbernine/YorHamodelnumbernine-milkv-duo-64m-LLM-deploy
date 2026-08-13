@@ -82,4 +82,54 @@ ps32 硬件路径**可行但被两遍法支配**：submit 更多、工程更重�
 
 `ps32_probe18.c`（forced c=1 全 N 列验证）、`ps32_probe19.c`（批量吞吐）、
 `ps32_probe19b.c`（N≥256 诊断）、`ps32_probe20.c`（宽度上限扫描）、
-`ps32_probe21.c`（批量 build/run 成本）。
+`ps32_probe21.c`（批量 build/run 成本）、`ps32_probe22.c`（elemwise 格式 + N≥224 诊断）、
+`ps32_probe23.c`（c>1 多平面宽度验证）。
+
+---
+
+## 9. 补充裁定（对推理引擎工程师 4 问，probe22/23 实测）
+
+### ① ps32_mode==2 输出 fp32？
+**否。** mode=2 + res_is_int8=1 → **int32 部分和**（byte-plane，N≤192 精确）。
+res_is_int8=0 / FMT_BF16 → **全零**（probe5）。头文件注释「mode==2→fp32」在本片不成立；
+CV1800B TIU 无 fp32 累加器，fp32 输出结构上不可读取。
+
+### ② element_wise_* 支持 F32/BF16？
+**否。** 头文件：add/sub「must all be 16-bit」（hi/lo 8-bit 对，纯整数）；mul/mac
+res_high/res_low + rshift/lshift，8/16-bit 整数；mac res 必须 16-bit。上板（probe22）：
+FMT_I8 mul 正确，**FMT_BF16 mul 输出无效**，**F32 传输被 TDMA 断言拒绝**
+（`fmt==I8||U8||BF16`）。
+→ **「acc_fp32 = acc + partial_int32*scale_g」LMEM 闭环不可实现**（fp32 不可传输/不可乘/不可累加）。
+**必须 CPU 回环**：int32 l2g 读出 → CPU fp32 scale + 累加。
+
+### ③ tK=32 + N-tile≤512 LMEM 可行？
+**N-tile≤512 不可行，硬上限 N=192/次。** probe20：N=192 全对、N=224+ 全列垃圾（连前 192 都错）。
+probe23：c>1（w=192 多平面）不能扩展——g2l 对 c>1 截断（只装前 192 列/行）、
+ps32_matrix_to_size 对 c>1 仅 4*W。
+- N-tile=192：right[32,192]=6KB + res 768B + left 32B ≈ 7KB < 32KB ✓
+- **每层最少 submit = 2432**（Wq 140 + Wk 28 + Wv 28 + Wo 20 + up 728 + gate 728 + down 760）；
+  ×24 ≈ **58k/token**（lm_head 另 ~22k）。「每组 1 次、无 N-tile」的 7.7k/token 假设不可行。
+
+### ④ 性能量级（58k ops/token）
+probe21 批量（N=192）：build ~1.9μs/op + run ~1.8μs/op，cmdbuf ~2000 op/256KB。
+TIU ~105ms + build ~110ms + g2l DMA ~185ms（可重叠）+ CPU fp32 累加 ~20-60ms
+→ **~300-500ms/token（~2-3 tok/s）计算侧**；decode 上界仍 SD 受限 ~11.6s/token。
+两遍法（49.5k submit、int8 读回 1/4 数据量、KG=128 7 块）**仍优于 ps32 硬件路径**。
+
+---
+
+## 10. 决定性 spike 更新（2026-08-13，CEO 最高优先级）：ps32_mode==2 fp32 一锤定音
+
+**上板实证（`ps32_dec_spike.c`，K=32/M=1/N=32，320000 精确判据）**：
+- **ps32_md 寄存器确认正确**：cmdbuf 反汇编逐字节验证 ps32=0/1/2 → ps32_md=0/1/2。
+- **ps32_mode==2 不输出 fp32**：res=BF16 + res_is_int8=0 → 输出 int8 饱和值复制（0x7f），
+  全 32KB 扫描 fp32(320000.0) 0 命中；res=F32 → matmul 算子 check_tiu_tensor 断言拒绝。
+- **仅 ps32_mode=2 + res_is_int8=1 → int32 部分和精确可读**（320000=0x4E200 byte-plane 32/32）。
+- **根因 = 硬件限制**：ps32_md=2 配置正确、回读路径与 int8 相同（C3 精确），
+  「fp32 if ps32_mode==2」注释仅存在于 bm1880v2.h/cvikernel.h（BM1880 家族继承），
+  **bmk1822.h 无此注释** → CV1800B TIU 无 fp32 累加/输出通路。
+- **element_wise 无 F32**：F32 张量分配断言拒绝（仅 I8/U8/BF16）；BF16 mul/mac 算术损坏；
+  → 变体1（纯 TPU fp32 累加）判负，变体2（CPU 回环）为 ps32 唯一形态（+0.5-1s/token）。
+- **Qwen submit 实测**：Wq140/Wk28/Wv28/Wo20/up728/gate728/down760 = 2432/层，×24=58,368；
+  lm_head 22,176；**80,544/token**；per-op build~1.8μs+run~1.8μs → ~290ms/token。
+- 详见 `REPORT_PS32_FP32_SPIKE_20260813.md`。

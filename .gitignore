@@ -44,6 +44,7 @@ smollm2_pool_b2_i4
 ps32_test
 ps32_probe*
 !ps32_probe*.c
+ps32_dec_spike
 
 # Personal dev helper (not part of the project)
 duo_dev.py
