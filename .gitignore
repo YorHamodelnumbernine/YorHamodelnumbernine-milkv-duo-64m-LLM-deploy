@@ -40,6 +40,11 @@ int4_bench
 int4_proto
 smollm2_pool_b2_i4
 
+# ps32 probe binaries (source kept)
+ps32_test
+ps32_probe*
+!ps32_probe*.c
+
 # Personal dev helper (not part of the project)
 duo_dev.py
 
