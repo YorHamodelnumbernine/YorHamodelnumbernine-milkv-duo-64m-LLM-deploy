@@ -491,24 +491,31 @@ static void sm_setup_ptrs(sm_layer_w_t *w, uint8_t *base, int D, int dkv, int F)
 struct pool_t;  /* forward declaration */
 
 typedef struct {
-    float *K[30], *V[30]; /* per-layer KV buffers (pointers into ION) */
+    int8_t *K[30], *V[30];     /* per-layer KV buffers in ION (INT8, raw QKV out) */
+    float  *K_s[30], *V_s[30]; /* per-layer per-token input scale (heap, small) */
 } sm_kv_cache_t;
 
 /* Implementation below, after pool_t is fully defined */
 
 static void sm_kv_free(sm_kv_cache_t *kv, const sm_cfg_t *c, CVI_RT_HANDLE rt) {
-    /* Buffers are inside ION — freed with pool.  Only the struct is on heap. */
+    /* K/V buffers are inside ION — freed with pool.  Scale arrays are heap. */
     if (!kv) return;
-    (void)c; (void)rt;
+    (void)rt;
+    int n = c ? c->n_layers : 30;
+    for (int l = 0; l < n; l++) { free(kv->K_s[l]); free(kv->V_s[l]); }
     free(kv);
 }
-static void sm_kv_store_contig(float *cache, const float *new_data, int seq, int pos, int dkv) {
-    memcpy(cache+pos*dkv, new_data, seq*dkv*sizeof(float));
+/* Store the raw INT8 QKV matmul output (pre-dequant / pre-RoPE) + the input
+ * scale sc_x used to dequantize it.  On read we reconstruct the exact FP32
+ * K/V the baseline derives (v = i8 * sc_x * (1<<rshift) * per-channel lsc),
+ * then re-apply RoPE for K.  This makes the INT8 KV cache bit-exact vs the
+ * FP32 baseline — the only precision loss is the inherent INT8 QKV matmul
+ * precision, which is identical in both paths.  No extra quantization noise. */
+static void kv_store_i8(int8_t *cache, float *scale, const int8_t *new_data,
+                        int seq, int pos, int dkv, float sc_x) {
+    memcpy(cache + (size_t)pos * dkv, new_data, (size_t)seq * dkv);
+    for (int s = 0; s < seq; s++) scale[pos + s] = sc_x;
 }
-static void sm_kv_load_contig(float *dst, const float *cache, int kv_len, int dkv) {
-    memcpy(dst, cache, kv_len*dkv*sizeof(float));
-}
-
 /* ================================================================
  *  Layer forward — uses tpu_matmul_build + batch Submit pattern
  *  (matching the proven approach from smollm2_demo.c).
@@ -597,10 +604,10 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
     }
     timing[4]+=TICK()-ts;
 
-    /* ---- KV cache store ---- */
+    /* ---- KV cache store (raw INT8 QKV output + input scale) ---- */
     ts=TICK();
-    sm_kv_store_contig(kv->K[layer],K_f32,seq,pos,dkv);
-    sm_kv_store_contig(kv->V[layer],V_f32,seq,pos,dkv);
+    kv_store_i8(kv->K[layer], kv->K_s[layer], K_i8, seq, pos, dkv, sc_x);
+    kv_store_i8(kv->V[layer], kv->V_s[layer], V_i8, seq, pos, dkv, sc_x);
     timing[5]+=TICK()-ts;
 
     /* ---- KV cache now in ION — read directly, no K_full/V_full copy ---- */
@@ -619,7 +626,22 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
         quantize_i8_sym((int8_t*)(nm+SM_Q_I8_OFF+g*Qg_sz),Qg_f32,Qg_sz,sc_qg[g]);
 
         float *Kh_f32 = grp_buf;  /* reuse grp_buf */
-        for(int s=0;s<kv_len;s++)memcpy(Kh_f32+s*d, kv->K[layer]+s*dkv+g*d, d*sizeof(float));
+        {
+            float b = (float)(1 << rshift_qkv);
+            const float *lsk = lsc ? lsc + ls_wk + g*d : NULL;
+            float sk_flat = lsc ? 0.0f : b * W_SCALE(layer,1);
+            for(int s=0;s<kv_len;s++){
+                float b_s = kv->K_s[layer][s] * b;   /* per-token input scale */
+                const int8_t *krow = kv->K[layer] + (size_t)s*dkv + g*d;
+                if (lsc) {
+                    for(int c=0;c<d;c++)Kh_f32[s*d+c]=(float)krow[c]*b_s*lsk[c];
+                } else {
+                    float sk = b_s * sk_flat;
+                    for(int c=0;c<d;c++)Kh_f32[s*d+c]=(float)krow[c]*sk;
+                }
+                rope_apply_single_f32(Kh_f32+s*d, d, s, rope_cos, rope_sin);
+            }
+        }
         sc_kh[g]=compute_scale_sym(Kh_f32,kv_len*d);
         quantize_i8_sym(Kh_i8_tmp,Kh_f32,kv_len*d,sc_kh[g]);
         int8_t *Kt=(int8_t*)(nm+SM_KT_I8_OFF+g*Kt_sz);
@@ -651,7 +673,21 @@ static int sm_layer_forward(tpu_ctx *ctx, cvk_context_t *cvk,
         quantize_i8_sym(Sg_i8,Scores_f32,seq*groups*kv_len,sc_sg[g]);
 
         float *Vh_f32 = grp_buf;  /* reuse grp_buf */
-        for(int s=0;s<kv_len;s++)memcpy(Vh_f32+s*d, kv->V[layer]+s*dkv+g*d, d*sizeof(float));
+        {
+            float b = (float)(1 << rshift_qkv);
+            const float *lsv = lsc ? lsc + ls_wv + g*d : NULL;
+            float sv_flat = lsc ? 0.0f : b * W_SCALE(layer,2);
+            for(int s=0;s<kv_len;s++){
+                float b_s = kv->V_s[layer][s] * b;   /* per-token input scale */
+                const int8_t *vrow = kv->V[layer] + (size_t)s*dkv + g*d;
+                if (lsc) {
+                    for(int c=0;c<d;c++)Vh_f32[s*d+c]=(float)vrow[c]*b_s*lsv[c];
+                } else {
+                    float sv = b_s * sv_flat;
+                    for(int c=0;c<d;c++)Vh_f32[s*d+c]=(float)vrow[c]*sv;
+                }
+            }
+        }
         sc_vh[g]=compute_scale_sym(Vh_f32,kv_len*d);
         quantize_i8_sym((int8_t*)(nm+SM_V_I8_OFF+g*kv_len*d),Vh_f32,kv_len*d,sc_vh[g]);
     }
@@ -1244,7 +1280,7 @@ static sm_kv_cache_t *sm_kv_alloc_ion(struct pool_t *pool, int max_seq, int dkv,
     if (!kv) return NULL;
     (void)rt;
 
-    int per_layer = max_seq * dkv * sizeof(float);
+    int per_layer = max_seq * dkv * 1;   /* INT8 KV */
     int per_layer_aligned = (per_layer + 255) & ~255;
     int kv_total = n_layers * 2 * per_layer_aligned;
     int kv_start = ION_POOL_SZ - kv_total;
@@ -1258,8 +1294,16 @@ static sm_kv_cache_t *sm_kv_alloc_ion(struct pool_t *pool, int max_seq, int dkv,
     uint8_t *kv_base = pool->ion_vaddr + kv_start;
     memset(kv_base, 0, kv_total);
     for (int l = 0; l < n_layers; l++) {
-        kv->K[l] = (float *)(kv_base + l * 2 * per_layer_aligned);
-        kv->V[l] = (float *)(kv_base + (l * 2 + 1) * per_layer_aligned);
+        kv->K[l] = (int8_t *)(kv_base + l * 2 * per_layer_aligned);
+        kv->V[l] = (int8_t *)(kv_base + (l * 2 + 1) * per_layer_aligned);
+        /* per-token input scale arrays on heap (do not consume ION budget) */
+        kv->K_s[l] = (float *)calloc(max_seq, sizeof(float));
+        kv->V_s[l] = (float *)calloc(max_seq, sizeof(float));
+        if (!kv->K_s[l] || !kv->V_s[l]) {
+            fprintf(stderr, "  KV: scale alloc failed\n");
+            sm_kv_free(kv, NULL, rt);
+            return NULL;
+        }
     }
 
     pool->kv_bytes  = kv_total;
@@ -2013,6 +2057,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ERROR: cannot read config.bin\n"); return 1;
     }
     int D=c.D, d=c.head_dim, F=c.FFN, V=c.V, max_seq=c.max_seq;
+    /* SM_MAX_SEQ: optional env override to raise max_seq (INT8 KV long-context test). */
+    { const char *ms = getenv("SM_MAX_SEQ");
+      if (ms && atoi(ms) > 0) { max_seq = atoi(ms); c.max_seq = max_seq;
+        fprintf(stderr, "[Init] SM_MAX_SEQ override -> %d\n", max_seq); } }
 
     fprintf(stderr, "SmolLM2-135M POOL: D=%d H=%d Kvh=%d d=%d L=%d F=%d V=%d max_seq=%d\n",
             D, c.n_heads, c.n_kv_heads, d, c.n_layers, F, V, max_seq);
