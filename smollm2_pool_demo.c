@@ -46,6 +46,42 @@ typedef struct {
 static lm_brk_t g_lm_brk;
 static int      g_lm_brk_on = 0;
 
+/* ---- ION orphan watchdog (DESIGN_ION_CLEANUP.md) ----
+ * A hung-but-alive process is what leaks the 24MB ION carveout pool and
+ * poisons later runs (ion ioctl fail:: Out of memory).  The watchdog thread
+ * monitors a main-thread heartbeat; if the main thread stalls — CVI_RT
+ * reopen-ion retry loop / TPU submit timeout / SD read stall — for
+ * SM_WD_TIMEOUT (default 30) seconds, it _exit()s so the kernel closes the
+ * ion/dma-buf fds and releases ION.  A dead process never leaks ION. */
+static volatile double g_wd_hb = 0;
+static double wd_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+static void wd_kick(void) { g_wd_hb = wd_now(); }
+
+static void *wd_thread(void *arg) {
+    (void)arg;
+    int to = 30;
+    { const char *e = getenv("SM_WD_TIMEOUT");
+      if (e && atoi(e) > 0) to = atoi(e); }
+    wd_kick();
+    for (;;) {
+        double last = g_wd_hb;
+        sleep(to);
+        if (g_wd_hb - last < 1e-6) {       /* no heartbeat for `to` s => hung */
+            fprintf(stderr, "[wd] NO HEARTBEAT >%ds — force _exit to release ION\n", to);
+            _exit(1);                      /* close fds -> kernel frees ION */
+        }
+    }
+    return NULL;
+}
+static void wd_start(void) {
+    pthread_t wd;
+    if (pthread_create(&wd, NULL, wd_thread, NULL) != 0)
+        fprintf(stderr, "[wd] watchdog thread create failed (non-fatal)\n");
+}
+
 /* ================================================================
  *  Runtime config
  * ================================================================ */
@@ -1168,7 +1204,11 @@ static int pool_init(pool_t *p, CVI_RT_HANDLE rt, const char *weight_dir,
 
     /* --- ION allocation --- */
     p->ion_mem = CVI_RT_MemAlloc(rt, ION_POOL_SZ);
-    if (!p->ion_mem) { fprintf(stderr, "  POOL: ION alloc failed\n"); return -1; }
+    if (!p->ion_mem) {
+        fprintf(stderr, "  POOL: ION alloc failed — check stale holders:\n");
+        system("cat /sys/kernel/debug/ion/cvi_carveout_heap_dump/summary 2>/dev/null");
+        return -1;
+    }
     p->ion_vaddr = (uint8_t *)CVI_RT_MemGetVAddr(p->ion_mem);
     p->ion_paddr = CVI_RT_MemGetPAddr(p->ion_mem);
     for (int i = 0; i < ION_MAX_SLOTS; i++) p->ion_slot_layer[i] = -1;
@@ -1319,6 +1359,7 @@ static sm_kv_cache_t *sm_kv_alloc_ion(struct pool_t *pool, int max_seq, int dkv,
 static int pool_load_embed_and_init_layers(pool_t *p) {
     char path[256];
     double ts = TICK();
+    wd_kick();   /* watchdog: init-phase milestone */
 
     /* Load embedding: split across DDR + ION.
      * Close/reopen between DDR and ION portions to release kernel page cache,
@@ -1347,6 +1388,7 @@ static int pool_load_embed_and_init_layers(pool_t *p) {
     }
     fprintf(stderr, "  Embed loaded: %.0f ms (%d KB DDR)\n",
             (TICK()-ts)/1000.0, p->embed_ddr_bytes/1024);
+    wd_kick();   /* watchdog: embed load milestone */
 
     /* Load first 3 layers into ION slots — reuse static staging buffer */
     ts = TICK();
@@ -1372,6 +1414,7 @@ static int pool_load_embed_and_init_layers(pool_t *p) {
     }
     fprintf(stderr, "  Init layers 0-%d: %.0f ms\n",
             n_init-1, (TICK()-ts)/1000.0);
+    wd_kick();   /* watchdog: init-layers milestone */
     return 0;
 }
 
@@ -1549,6 +1592,7 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
 {
     int D = c->D, V = c->V, L = c->n_layers;
     double ts;
+    wd_kick();   /* watchdog: forward entry (covers prefill chunk / decode step) */
 
     /* ---- Embedding: from pool (ION + DDR, opened in pool_init) ---- */
     ts = TICK();
@@ -1671,6 +1715,7 @@ static int sm_forward_pool(tpu_ctx *ctx, cvk_context_t *cvk, uint8_t *nm,
                 ts = TICK();
                 if (pf_wait(&pf_batch) != 0) { use_pipeline = 0; }
                 pf_inflight = 0;
+                wd_kick();   /* watchdog: per weight-batch prefetch done */
                 if (!use_pipeline) break;
                 CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
                 t->t_weight_load += TICK() - ts;
@@ -1699,6 +1744,7 @@ fallback:
         fprintf(stderr, "  [fallback] serial SD read + TPU (no pipeline)\n");
         /* Fallback: single ION slot, serial SD read + TPU */
         for (int i = 0; i < L; i++) {
+            wd_kick();   /* watchdog: per-layer in serial fallback */
             ts = TICK();
             char lpath[256];
             snprintf(lpath, sizeof(lpath), "%s/layer%d.bin", weight_dir, i);
@@ -1732,6 +1778,7 @@ fallback:
     }
 
     if (pf_inflight) { pf_wait(&pf_batch); pf_inflight = 0; }
+    wd_kick();   /* watchdog: layer loop complete, entering LM_Head */
     pthread_mutex_destroy(&pf_batch.lock);
     pthread_cond_destroy(&pf_batch.cond);
 
@@ -1893,6 +1940,7 @@ fallback:
     }
 
     for (int v_start = 0; v_start < V; v_start += CHUNK) {
+        wd_kick();   /* watchdog: LM_Head chunk */
         double _loop0 = TICK();
         int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
         int nxt = 1 - cur;
@@ -2046,6 +2094,17 @@ int main(int argc, char **argv) {
     int force_mode = (argc >= 5) ? atoi(argv[4]) : 0;
     int eos_id    = (argc >= 6) ? atoi(argv[5]) : 0;
     fprintf(stderr, "force_mode=%d (0=dynamic, 1-3=fixed), eos_id=%d\n", force_mode, eos_id);
+    /* Start ION-orphan watchdog BEFORE any CVI_RT / tpu_init call, so even a
+     * hang inside the library (reopen-ion retry loop) is force-killed and the
+     * kernel frees ION.  SM_WD_TIMEOUT env overrides the 30s default. */
+    wd_start();
+    /* TEST-ONLY: SM_HANG_TEST=1 spins main() forever to exercise the watchdog
+     * _exit path (normal runs never enter this). */
+    { const char *ht = getenv("SM_HANG_TEST");
+      if (ht && atoi(ht) > 0) {
+          fprintf(stderr, "[wd] SM_HANG_TEST set — spinning main; watchdog should _exit\n");
+          for (;;) { }
+      } }
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
       xorshift_state = (uint32_t)(ts.tv_sec ^ ts.tv_nsec); }
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -2096,6 +2155,7 @@ int main(int argc, char **argv) {
 
     tpu_ctx ctx;
     if(tpu_init(&ctx,NEURON_SZ)!=0){fprintf(stderr,"TPU init failed!\n");return 1;}
+    wd_kick();   /* watchdog: tpu_init done */
     cvk_context_t *cvk=ctx.cvk_ctx; uint8_t *nm=ctx.neuron_vaddr;
 
     /* Test MemFlush right after tpu_init */
@@ -2136,6 +2196,15 @@ int main(int argc, char **argv) {
     pool_t pool;
     if(pool_init(&pool,ctx.rt_handle,weight_dir,D,c.d_qkv,F)!=0){
         fprintf(stderr,"Pool init failed!\n");return 1;}
+    wd_kick();   /* watchdog: pool_init done */
+    /* TEST-ONLY: SM_HANG_AFTER_INIT=1 spins AFTER ION is allocated, so the
+     * watchdog has to kill a live ION holder and the kernel must free ION. */
+    { const char *ha = getenv("SM_HANG_AFTER_INIT");
+      if (ha && atoi(ha) > 0) {
+          fprintf(stderr, "[wd] SM_HANG_AFTER_INIT set — spinning with ION held; "
+                          "watchdog should _exit and release ION\n");
+          for (;;) { }
+      } }
     fprintf(stderr, "[swap] after pool_init: VmSwap=%d KB\n", get_swap_kb());
 
     /* Test MemFlush after pool_init */
@@ -2158,6 +2227,7 @@ int main(int argc, char **argv) {
 
     if(pool_load_embed_and_init_layers(&pool)!=0){
         fprintf(stderr,"Embed+init layers load failed!\n");return 1;}
+    wd_kick();   /* watchdog: embed+init layers done */
     fprintf(stderr, "[swap] after embed+init load: VmSwap=%d KB\n", get_swap_kb());
 
     /* Test MemFlush after embed load */
@@ -2227,6 +2297,7 @@ int main(int argc, char **argv) {
     free(chunk_logits);
     t_prefill = TICK() - t_prefill;
     fprintf(stderr,"  Prefill: %.0f ms, next_token=%d\n",t_prefill/1000.0,next_token);
+    wd_kick();   /* watchdog: prefill done */
 
     /* ---- Decode ---- */
     fprintf(stderr,"\n[Decode] %d tokens...\n",max_new);
