@@ -1,0 +1,96 @@
+{
+ "note": "Path A per-group scale sweep, KG=G (group-structure lock); requant from fp32 at each group size",
+ "kgs": [
+  64,
+  128
+ ],
+ "mode": "exact",
+ "64": {
+  "verdict": "2/3",
+  "prompts": {
+   "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+    "next": 2130,
+    "ref": 2130,
+    "ok": true,
+    "gap": 0.9018421173095703,
+    "top5": [
+     2130,
+     68990,
+     9909,
+     198,
+     101314
+    ]
+   },
+   "The capital of France is": {
+    "next": 12095,
+    "ref": 12095,
+    "ok": true,
+    "gap": 2.150808334350586,
+    "top5": [
+     12095,
+     7407,
+     279,
+     264,
+     2598
+    ]
+   },
+   "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+    "next": 111261,
+    "ref": 99366,
+    "ok": false,
+    "gap": 0.3577308654785156,
+    "top5": [
+     111261,
+     99366,
+     109280,
+     69249,
+     99632
+    ]
+   }
+  }
+ },
+ "128": {
+  "verdict": "2/3",
+  "prompts": {
+   "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+    "next": 2130,
+    "ref": 2130,
+    "ok": true,
+    "gap": 1.0674209594726562,
+    "top5": [
+     2130,
+     68990,
+     198,
+     101314,
+     104554
+    ]
+   },
+   "The capital of France is": {
+    "next": 12095,
+    "ref": 12095,
+    "ok": true,
+    "gap": 1.0696773529052734,
+    "top5": [
+     12095,
+     7407,
+     510,
+     2598,
+     279
+    ]
+   },
+   "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+    "next": 111261,
+    "ref": 99366,
+    "ok": false,
+    "gap": 1.0848445892333984,
+    "top5": [
+     111261,
+     99366,
+     99632,
+     99924,
+     109280
+    ]
+   }
+  }
+ }
+}

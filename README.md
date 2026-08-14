@@ -258,6 +258,37 @@ Precise regression: `/root/smollm2_pool_demo <weights> <tokens.bin> 3 3 2`
 - [ ] Hot-layer weight residency in DDR/ION (cut per-token SD traffic)
 - [ ] SDIO access from secondary core (C906L)
 
+## Phase 8 出货配置与回滚（Qwen 24L 引擎，2026-08-15 签核）
+
+Phase 8 收口决定：A'（整层 ion_db 预取 11.72s）与 B-2（per-matrix ion_db 预取）**均未过
+9.5s 验收线**，SD 20.2MiB/s + ION 28.1MB 硬件天花板确认（理论地板 ~9.45s 不可达）。
+
+**出货配置（引擎默认，无需任何环境变量）**：
+- 读路径：`LW_READ=mmap`（`g_lw_mode=LW_MMAP`，未设置环境变量时即默认）
+- gsc：`GSC_ION=1`（默认开启，24 层 gsc 全 ION 缓存）
+- 实测 decode = **11.29s/token**（`experiments/qwen_onboard/decode_e1_v0.log` 锚点）
+- `LW_READ=ion_db` 为已收口实验路径（负优化），仅回归对照用，默认不启用。
+
+**一键回滚命令（出货基线 = 默认，零重建）**：
+```sh
+# 若曾跑过 ion_db 实验，先释放其 ION SD_BUF
+sh /data/qwen/run_clean.sh --clean qwen_engine_lmhead2_aprime
+# 以 mmap + gsc ION 出货配置跑 decode（无需设 LW_READ/GSC_ION，缺省即出货）
+cd /data/qwen && VERIFY=0 RSH=1 DECODE=1 DECODE_STEPS=6 PROFILE=1 \
+  ./qwen_engine_lmhead2 | tee decode_rollback_mmap.log
+# 或直接用已知良好二进制（无需重编）
+cd /data/qwen && GSC_ION=1 VERIFY=0 RSH=1 DECODE=1 DECODE_STEPS=6 PROFILE=1 \
+  ./qwen_engine_lmhead2_phase7e | tee decode_rollback_mmap.log
+```
+回归确认：`avg≈11.29±0.5`、NEXT 3/3、bit-exact 4 项=0。详见
+`experiments/qwen_onboard/REPORT_APRIME_INTEGRATION_REVIEW_20260815.md`（Phase 8 最终版）。
+
+**Phase 8 回归工具链**（标注在 `experiments/qwen_onboard/`）：
+```sh
+sh phase7_deploy_run_host.sh aprime 6     # 板上三档: B 基线 mmap / A perf ion_db / A corr VERIFY=1
+python3 phase7_analyze_logs.py            # 对比表 + 验收线 9.5s 自动判定 + 回归清单
+```
+
 ## License
 
 MIT

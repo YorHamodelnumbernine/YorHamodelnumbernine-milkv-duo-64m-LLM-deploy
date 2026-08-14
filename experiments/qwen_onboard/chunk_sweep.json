@@ -1,0 +1,82 @@
+{
+ "32": {
+  "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+   "next": 2130,
+   "ref": 2130,
+   "ok": true,
+   "gap": 1.3265724182128906
+  },
+  "The capital of France is": {
+   "next": 12095,
+   "ref": 12095,
+   "ok": true,
+   "gap": 0.7219924926757812
+  },
+  "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+   "next": 99366,
+   "ref": 99366,
+   "ok": true,
+   "gap": 0.5240573883056641
+  }
+ },
+ "64": {
+  "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+   "next": 2130,
+   "ref": 2130,
+   "ok": true,
+   "gap": 0.9696044921875
+  },
+  "The capital of France is": {
+   "next": 12095,
+   "ref": 12095,
+   "ok": true,
+   "gap": 1.087118148803711
+  },
+  "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+   "next": 99366,
+   "ref": 99366,
+   "ok": true,
+   "gap": 0.005237579345703125
+  }
+ },
+ "128": {
+  "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+   "next": 2130,
+   "ref": 2130,
+   "ok": true,
+   "gap": 0.94525146484375
+  },
+  "The capital of France is": {
+   "next": 12095,
+   "ref": 12095,
+   "ok": true,
+   "gap": 1.2265281677246094
+  },
+  "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+   "next": 99366,
+   "ref": 99366,
+   "ok": true,
+   "gap": 0.21547317504882812
+  }
+ },
+ "256": {
+  "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+   "next": 2130,
+   "ref": 2130,
+   "ok": true,
+   "gap": 0.84130859375
+  },
+  "The capital of France is": {
+   "next": 12095,
+   "ref": 12095,
+   "ok": true,
+   "gap": 0.8894023895263672
+  },
+  "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+   "next": 99366,
+   "ref": 99366,
+   "ok": true,
+   "gap": 0.18949508666992188
+  }
+ }
+}

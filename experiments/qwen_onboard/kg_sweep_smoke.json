@@ -1,0 +1,50 @@
+{
+ "note": "Path A per-group scale sweep, KG=G (group-structure lock); requant from fp32 at each group size",
+ "kgs": [
+  32
+ ],
+ "32": {
+  "verdict": "3/3",
+  "prompts": {
+   "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+    "next": 2130,
+    "ref": 2130,
+    "ok": true,
+    "gap": 1.9104347229003906,
+    "top5": [
+     2130,
+     68990,
+     198,
+     9909,
+     220
+    ]
+   },
+   "The capital of France is": {
+    "next": 12095,
+    "ref": 12095,
+    "ok": true,
+    "gap": 1.1893444061279297,
+    "top5": [
+     12095,
+     32671,
+     30743,
+     1304,
+     7407
+    ]
+   },
+   "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+    "next": 99366,
+    "ref": 99366,
+    "ok": true,
+    "gap": 0.11595535278320312,
+    "top5": [
+     99366,
+     111261,
+     109280,
+     69249,
+     112635
+    ]
+   }
+  }
+ }
+}

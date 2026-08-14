@@ -141,15 +141,24 @@ naive per-submit（register+alloc+convert+load+Run）0.55ms/submit 不可接受
 （REPORT_PATHA_KG32 §2.2）；预建 cmdbuf 后 Run+Invld 0.14ms、完整两遍法
 0.44ms/block → C 流水 ≈3.4s/token < SD 9.18s（REPORT_SUBMIT_BUDGET §1）。
 
-| tiling 口径 | submits/layer | submits/token | 批量成本 @3.7μs/op | 依据 |
+| tiling 口径 | runs/layer | runs/token | 批量成本 @3.7μs/op | 依据 |
 |---|---|---|---|---|
-| **A' 实际**：KG=32 + N-tile=896（patha_kg32 P3 实测，k/v 1 tile、up/gate 6 tile） | 640（6×56 + down 304） | **15,360** | ~57ms/token（余量 ~160×） | REPORT_PATHA_KG32 §2.1 |
+| **A' 实际（引擎口径，2026-08-13 M2 修正）**：KG=32 + N-tile=896，engine per-tile RunCmdbufEx（q/k/v/wo 1 tile、up/gate 6 tile） | **1200** pass runs（q/k/v/wo 224 + up 336 + gate 336 + down 304）+ **600 g2l**（④a no-reload） | **28,800**（pass runs；含 g2l 43,200） | pass-only ~107ms/token（余量 ~86×）；含 g2l ~160ms/token（余量 ~57×） | REPORT_M2_TIU_CORE §3 |
 | 设计默认：KG=32 + N-tile=512（k/v 等窄矩阵仍 1 tile） | 2,064 | **≈49,500** | ~183ms/token（余量 ~50×） | DESIGN_PATH_A_TWOPASS §2 |
 | 保守：G=32 + N-chunk=192（PS32 per-group 口径，**含 lm_head**） | — | **80,544** | ~0.30s/token（余量 ≥30×，CEO ≥34×） | PS32_PER_GROUP_VERDICT §3 |
 
-- **三口径均 SD-bound**：批量成本 0.06–0.30s/token ≪ SD 9.18s/token，不影响 decode 上界。
-- **勿混用**：三个数字对应不同 tiling（N-tile=896 / 512 / 192 及是否含 lm_head）。
-  引擎 spec 必须固定实际 tiling 并自洽；引用时必须带 tiling 前缀（如"N-tile=896 时 15,360/token"）。
+> **提交量口径修正（2026-08-13，M2 引擎上板定稿）**：原"A' 实际 640/layer（15,360/token）"
+> 为 patha_kg32 P3 探针**合并口径**——单 cmdbuf 内顺序 6×(g2l tile, mm, l2g)。引擎实现按
+> **每 tile 一次 RunCmdbufEx**（[32,4864] 右矩阵 155KB > 32KB LMEM 无法整块驻留，须逐 tile
+> g2l+mm），真实 **1200 pass runs/layer**（+600 g2l no-reload = 1800 runs/layer）。
+> 批量成本：pass-only ~107ms/token、含 g2l ~160ms/token，余量 ≥57×，**仍 SD-bound**。
+> M2 上板实测 per-RunCmdbufEx=0.145ms → pass-only 4.17s/token、全 runs 6.26s/token，
+> 流水线 max(SD 9.18, ~7.98) → **余量 1.15×**。结论不变：**build 摊销（预建 cmdbuf 池）为硬前提**。
+
+- **各口径均 SD-bound**：批量成本 0.11–0.30s/token ≪ SD 9.18s/token，不影响 decode 上界。
+- **勿混用**：各数字对应不同 tiling 与 run 口径（N-tile=896 per-tile / 512 / 192、是否含 g2l、
+  是否含 lm_head）。引擎 spec 必须固定实际 tiling 并自洽；引用时必须带口径前缀
+  （如"N-tile=896 per-tile 时 28,800 pass runs/token、含 g2l 43,200"）。
 
 ## 7. 合并与验收记录（CEO 裁定 2026-08-13）
 

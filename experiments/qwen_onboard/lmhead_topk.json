@@ -1,0 +1,1065 @@
+{
+ "subsample": 12288,
+ "iters": 6,
+ "seed": 7,
+ "prompts": [
+  {
+   "name": "P1 \u4e2d\u56fd\u7684\u9996\u90fd\u662f",
+   "tokens": [
+    105538,
+    59975,
+    100132
+   ],
+   "gold_top1": 2130
+  },
+  {
+   "name": "P2 The capital of France is",
+   "tokens": [
+    785,
+    6722,
+    315,
+    9625,
+    374
+   ],
+   "gold_top1": 12095
+  },
+  {
+   "name": "P3 \u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed",
+   "tokens": [
+    100644,
+    104307,
+    101243,
+    3837,
+    97639,
+    85336,
+    102077
+   ],
+   "gold_top1": 99366
+  },
+  {
+   "name": "The capital of Japan is",
+   "tokens": [
+    785,
+    6722,
+    315,
+    6323,
+    374
+   ],
+   "gold_top1": 7407
+  },
+  {
+   "name": "Python is a programming language used for",
+   "tokens": [
+    30280,
+    374,
+    264,
+    15473,
+    4128,
+    1483,
+    369
+   ],
+   "gold_top1": 6825
+  },
+  {
+   "name": "The largest ocean on Earth is the",
+   "tokens": [
+    785,
+    7772,
+    17951,
+    389,
+    9237,
+    374,
+    279
+   ],
+   "gold_top1": 1304
+  },
+  {
+   "name": "Who invented the telephone?",
+   "tokens": [
+    15191,
+    35492,
+    279,
+    20544,
+    30
+   ],
+   "gold_top1": 362
+  },
+  {
+   "name": "\u4eba\u5de5\u667a\u80fd\u7684\u672a\u6765\u53d1\u5c55\u65b9\u5411\u662f",
+   "tokens": [
+    104455,
+    9370,
+    100353,
+    108726,
+    20412
+   ],
+   "gold_top1": 2130
+  },
+  {
+   "name": "\u4e0a\u6d77\u662f\u4e2d\u56fd\u6700\u5927\u7684\u57ce\u5e02",
+   "tokens": [
+    100633,
+    105196,
+    104003,
+    99490
+   ],
+   "gold_top1": 3837
+  },
+  {
+   "name": "\u91cf\u5b50\u8ba1\u7b97\u7684\u57fa\u672c\u539f\u7406\u662f",
+   "tokens": [
+    109539,
+    100768,
+    105166,
+    105318,
+    20412
+   ],
+   "gold_top1": 100152
+  },
+  {
+   "name": "\u5149\u5408\u4f5c\u7528\u7684\u8fc7\u7a0b\u662f",
+   "tokens": [
+    99225,
+    99721,
+    11622,
+    105080,
+    20412
+   ],
+   "gold_top1": 2130
+  }
+ ],
+ "results": {
+  "512": {
+   "per_prompt": {
+    "P1 \u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+     "gold_top1": 2130,
+     "g1_cluster": 45,
+     "g1_cluster_rank": 2,
+     "kcs": {
+      "4": {
+       "recall1": true,
+       "top5": 1,
+       "cand_size": 132
+      },
+      "8": {
+       "recall1": true,
+       "top5": 1,
+       "cand_size": 137
+      },
+      "16": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 458
+      },
+      "32": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 554
+      },
+      "64": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 2139
+      },
+      "128": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 3054
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 48630
+      }
+     }
+    },
+    "P2 The capital of France is": {
+     "gold_top1": 12095,
+     "g1_cluster": 37,
+     "g1_cluster_rank": 124,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 32
+      },
+      "8": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 368
+      },
+      "16": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 435
+      },
+      "32": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 734
+      },
+      "64": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 1643
+      },
+      "128": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 45136
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 47468
+      }
+     }
+    },
+    "P3 \u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+     "gold_top1": 99366,
+     "g1_cluster": 37,
+     "g1_cluster_rank": 157,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 23
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 29
+      },
+      "16": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 141
+      },
+      "32": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 619
+      },
+      "64": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 919
+      },
+      "128": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 2269
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 47200
+      }
+     }
+    },
+    "The capital of Japan is": {
+     "gold_top1": 7407,
+     "g1_cluster": 37,
+     "g1_cluster_rank": 141,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 33
+      },
+      "8": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 342
+      },
+      "16": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 410
+      },
+      "32": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 757
+      },
+      "64": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 1581
+      },
+      "128": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 3363
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 48009
+      }
+     }
+    },
+    "Python is a programming language used for": {
+     "gold_top1": 6825,
+     "g1_cluster": 37,
+     "g1_cluster_rank": 157,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 45
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 95
+      },
+      "16": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 424
+      },
+      "32": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 796
+      },
+      "64": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 1188
+      },
+      "128": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 3962
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 49281
+      }
+     }
+    },
+    "The largest ocean on Earth is the": {
+     "gold_top1": 1304,
+     "g1_cluster": 337,
+     "g1_cluster_rank": 29,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 25
+      },
+      "8": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 79
+      },
+      "16": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 473
+      },
+      "32": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1107
+      },
+      "64": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 2489
+      },
+      "128": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 4903
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 48800
+      }
+     }
+    },
+    "Who invented the telephone?": {
+     "gold_top1": 362,
+     "g1_cluster": 361,
+     "g1_cluster_rank": 8,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 15
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 106
+      },
+      "16": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 438
+      },
+      "32": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 587
+      },
+      "64": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 1115
+      },
+      "128": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 2962
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 111476
+      }
+     }
+    },
+    "\u4eba\u5de5\u667a\u80fd\u7684\u672a\u6765\u53d1\u5c55\u65b9\u5411\u662f": {
+     "gold_top1": 2130,
+     "g1_cluster": 45,
+     "g1_cluster_rank": 7,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 5
+      },
+      "8": {
+       "recall1": true,
+       "top5": 1,
+       "cand_size": 137
+      },
+      "16": {
+       "recall1": true,
+       "top5": 1,
+       "cand_size": 255
+      },
+      "32": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 805
+      },
+      "64": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 983
+      },
+      "128": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 2952
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 47249
+      }
+     }
+    },
+    "\u4e0a\u6d77\u662f\u4e2d\u56fd\u6700\u5927\u7684\u57ce\u5e02": {
+     "gold_top1": 3837,
+     "g1_cluster": 361,
+     "g1_cluster_rank": 25,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 59
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 101
+      },
+      "16": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 209
+      },
+      "32": {
+       "recall1": true,
+       "top5": 2,
+       "cand_size": 580
+      },
+      "64": {
+       "recall1": true,
+       "top5": 2,
+       "cand_size": 1225
+      },
+      "128": {
+       "recall1": true,
+       "top5": 3,
+       "cand_size": 2080
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 111476
+      }
+     }
+    },
+    "\u91cf\u5b50\u8ba1\u7b97\u7684\u57fa\u672c\u539f\u7406\u662f": {
+     "gold_top1": 100152,
+     "g1_cluster": 37,
+     "g1_cluster_rank": 178,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 81
+      },
+      "8": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 169
+      },
+      "16": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 502
+      },
+      "32": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 626
+      },
+      "64": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 1577
+      },
+      "128": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 2593
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 48684
+      }
+     }
+    },
+    "\u5149\u5408\u4f5c\u7528\u7684\u8fc7\u7a0b\u662f": {
+     "gold_top1": 2130,
+     "g1_cluster": 45,
+     "g1_cluster_rank": 1,
+     "kcs": {
+      "4": {
+       "recall1": true,
+       "top5": 1,
+       "cand_size": 141
+      },
+      "8": {
+       "recall1": true,
+       "top5": 1,
+       "cand_size": 147
+      },
+      "16": {
+       "recall1": true,
+       "top5": 3,
+       "cand_size": 527
+      },
+      "32": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 767
+      },
+      "64": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1641
+      },
+      "128": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 2701
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 48476
+      }
+     }
+    }
+   }
+  },
+  "1024": {
+   "per_prompt": {
+    "P1 \u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+     "gold_top1": 2130,
+     "g1_cluster": 711,
+     "g1_cluster_rank": 14,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 75
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 109
+      },
+      "16": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 676
+      },
+      "32": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 769
+      },
+      "64": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1249
+      },
+      "128": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1767
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 18821
+      }
+     }
+    },
+    "P2 The capital of France is": {
+     "gold_top1": 12095,
+     "g1_cluster": 701,
+     "g1_cluster_rank": 164,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 45
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 66
+      },
+      "16": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 96
+      },
+      "32": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 735
+      },
+      "64": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 949
+      },
+      "128": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 1742
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 18457
+      }
+     }
+    },
+    "P3 \u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+     "gold_top1": 99366,
+     "g1_cluster": 701,
+     "g1_cluster_rank": 241,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 23
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 35
+      },
+      "16": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 133
+      },
+      "32": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 228
+      },
+      "64": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 377
+      },
+      "128": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 1416
+      },
+      "256": {
+       "recall1": true,
+       "top5": 3,
+       "cand_size": 17761
+      }
+     }
+    },
+    "The capital of Japan is": {
+     "gold_top1": 7407,
+     "g1_cluster": 701,
+     "g1_cluster_rank": 174,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 43
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 52
+      },
+      "16": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 101
+      },
+      "32": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 739
+      },
+      "64": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 1094
+      },
+      "128": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 1797
+      },
+      "256": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 18253
+      }
+     }
+    },
+    "Python is a programming language used for": {
+     "gold_top1": 6825,
+     "g1_cluster": 701,
+     "g1_cluster_rank": 176,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 12
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 31
+      },
+      "16": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 151
+      },
+      "32": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 372
+      },
+      "64": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 1267
+      },
+      "128": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 2170
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 19492
+      }
+     }
+    },
+    "The largest ocean on Earth is the": {
+     "gold_top1": 1304,
+     "g1_cluster": 711,
+     "g1_cluster_rank": 11,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 32
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 74
+      },
+      "16": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 614
+      },
+      "32": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 738
+      },
+      "64": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1331
+      },
+      "128": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 2328
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 20415
+      }
+     }
+    },
+    "Who invented the telephone?": {
+     "gold_top1": 362,
+     "g1_cluster": 711,
+     "g1_cluster_rank": 35,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 78
+      },
+      "8": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 99
+      },
+      "16": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 122
+      },
+      "32": {
+       "recall1": false,
+       "top5": 2,
+       "cand_size": 225
+      },
+      "64": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 895
+      },
+      "128": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 1517
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 17689
+      }
+     }
+    },
+    "\u4eba\u5de5\u667a\u80fd\u7684\u672a\u6765\u53d1\u5c55\u65b9\u5411\u662f": {
+     "gold_top1": 2130,
+     "g1_cluster": 711,
+     "g1_cluster_rank": 17,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 66
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 78
+      },
+      "16": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 154
+      },
+      "32": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 781
+      },
+      "64": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1025
+      },
+      "128": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1839
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 18160
+      }
+     }
+    },
+    "\u4e0a\u6d77\u662f\u4e2d\u56fd\u6700\u5927\u7684\u57ce\u5e02": {
+     "gold_top1": 3837,
+     "g1_cluster": 711,
+     "g1_cluster_rank": 54,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 21
+      },
+      "8": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 49
+      },
+      "16": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 186
+      },
+      "32": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 272
+      },
+      "64": {
+       "recall1": true,
+       "top5": 3,
+       "cand_size": 911
+      },
+      "128": {
+       "recall1": true,
+       "top5": 3,
+       "cand_size": 1298
+      },
+      "256": {
+       "recall1": true,
+       "top5": 3,
+       "cand_size": 2768
+      }
+     }
+    },
+    "\u91cf\u5b50\u8ba1\u7b97\u7684\u57fa\u672c\u539f\u7406\u662f": {
+     "gold_top1": 100152,
+     "g1_cluster": 701,
+     "g1_cluster_rank": 246,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 67
+      },
+      "8": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 86
+      },
+      "16": {
+       "recall1": false,
+       "top5": 1,
+       "cand_size": 131
+      },
+      "32": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 716
+      },
+      "64": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 947
+      },
+      "128": {
+       "recall1": false,
+       "top5": 3,
+       "cand_size": 1732
+      },
+      "256": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 18630
+      }
+     }
+    },
+    "\u5149\u5408\u4f5c\u7528\u7684\u8fc7\u7a0b\u662f": {
+     "gold_top1": 2130,
+     "g1_cluster": 711,
+     "g1_cluster_rank": 15,
+     "kcs": {
+      "4": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 76
+      },
+      "8": {
+       "recall1": false,
+       "top5": 0,
+       "cand_size": 109
+      },
+      "16": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 640
+      },
+      "32": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 804
+      },
+      "64": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1016
+      },
+      "128": {
+       "recall1": true,
+       "top5": 4,
+       "cand_size": 1929
+      },
+      "256": {
+       "recall1": true,
+       "top5": 5,
+       "cand_size": 18155
+      }
+     }
+    }
+   }
+  }
+ }
+}

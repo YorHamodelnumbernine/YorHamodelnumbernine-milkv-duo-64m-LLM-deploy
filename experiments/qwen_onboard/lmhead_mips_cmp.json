@@ -1,0 +1,1798 @@
+{
+ "A_euclid": {
+  "kind": "euclid",
+  "xs": [
+   8,
+   16,
+   32,
+   64,
+   128,
+   256,
+   512
+  ],
+  "per_prompt": {
+   "P1 \u4e2d\u56fd\u7684\u9996\u90fd\u662f": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 109
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 676
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 769
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 1249
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 1767
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 18821
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 62490
+    }
+   ],
+   "P2 The capital of France is": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 66
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 96
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 735
+    },
+    {
+     "x": 64,
+     "recall1": false,
+     "cand_size": 949
+    },
+    {
+     "x": 128,
+     "recall1": false,
+     "cand_size": 1742
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 18457
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 62717
+    }
+   ],
+   "P3 \u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 35
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 133
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 228
+    },
+    {
+     "x": 64,
+     "recall1": false,
+     "cand_size": 377
+    },
+    {
+     "x": 128,
+     "recall1": false,
+     "cand_size": 1416
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 17761
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 62245
+    }
+   ],
+   "The capital of Japan is": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 52
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 101
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 739
+    },
+    {
+     "x": 64,
+     "recall1": false,
+     "cand_size": 1094
+    },
+    {
+     "x": 128,
+     "recall1": false,
+     "cand_size": 1797
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 18253
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 62965
+    }
+   ],
+   "Python is a programming language used for": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 31
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 151
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 372
+    },
+    {
+     "x": 64,
+     "recall1": false,
+     "cand_size": 1267
+    },
+    {
+     "x": 128,
+     "recall1": false,
+     "cand_size": 2170
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 19492
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 63528
+    }
+   ],
+   "The largest ocean on Earth is the": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 74
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 614
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 738
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 1331
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 2328
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 20415
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 62974
+    }
+   ],
+   "Who invented the telephone?": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 99
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 122
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 225
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 895
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 1517
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 17689
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 61486
+    }
+   ],
+   "\u4eba\u5de5\u667a\u80fd\u7684\u672a\u6765\u53d1\u5c55\u65b9\u5411\u662f": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 78
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 154
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 781
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 1025
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 1839
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 18160
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 61979
+    }
+   ],
+   "\u4e0a\u6d77\u662f\u4e2d\u56fd\u6700\u5927\u7684\u57ce\u5e02": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 49
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 186
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 272
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 911
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 1298
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 2768
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 60713
+    }
+   ],
+   "\u91cf\u5b50\u8ba1\u7b97\u7684\u57fa\u672c\u539f\u7406\u662f": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 86
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 131
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 716
+    },
+    {
+     "x": 64,
+     "recall1": false,
+     "cand_size": 947
+    },
+    {
+     "x": 128,
+     "recall1": false,
+     "cand_size": 1732
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 18630
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 62822
+    }
+   ],
+   "\u5149\u5408\u4f5c\u7528\u7684\u8fc7\u7a0b\u662f": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 109
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 640
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 804
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 1016
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 1929
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 18155
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 62390
+    }
+   ]
+  }
+ },
+ "B_mdp": {
+  "kind": "mdp",
+  "xs": [
+   8,
+   16,
+   32,
+   64,
+   128,
+   256,
+   512
+  ],
+  "per_prompt": {
+   "P1 \u4e2d\u56fd\u7684\u9996\u90fd\u662f": [
+    {
+     "x": 8,
+     "recall1": true,
+     "cand_size": 237
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 427
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 1275
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 2563
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 6498
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 13977
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 28851
+    }
+   ],
+   "P2 The capital of France is": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 717
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 1388
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 2374
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 4306
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 8254
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 16768
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 33816
+    }
+   ],
+   "P3 \u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": [
+    {
+     "x": 8,
+     "recall1": true,
+     "cand_size": 234
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 458
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 1032
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 2732
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 6157
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 13428
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 29415
+    }
+   ],
+   "The capital of Japan is": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 701
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 1472
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 2190
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 4364
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 8986
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 17253
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 33781
+    }
+   ],
+   "Python is a programming language used for": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 1097
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 1903
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 3191
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 5758
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 10189
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 19274
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 35951
+    }
+   ],
+   "The largest ocean on Earth is the": [
+    {
+     "x": 8,
+     "recall1": true,
+     "cand_size": 394
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 901
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 1748
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 3708
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 7315
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 15549
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 32860
+    }
+   ],
+   "Who invented the telephone?": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 560
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 1046
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 1676
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 3425
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 7366
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 15567
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 32985
+    }
+   ],
+   "\u4eba\u5de5\u667a\u80fd\u7684\u672a\u6765\u53d1\u5c55\u65b9\u5411\u662f": [
+    {
+     "x": 8,
+     "recall1": true,
+     "cand_size": 270
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 414
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 1054
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 2846
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 6612
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 14427
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 31738
+    }
+   ],
+   "\u4e0a\u6d77\u662f\u4e2d\u56fd\u6700\u5927\u7684\u57ce\u5e02": [
+    {
+     "x": 8,
+     "recall1": true,
+     "cand_size": 214
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 435
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 1217
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 2804
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 6676
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 13757
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 29758
+    }
+   ],
+   "\u91cf\u5b50\u8ba1\u7b97\u7684\u57fa\u672c\u539f\u7406\u662f": [
+    {
+     "x": 8,
+     "recall1": false,
+     "cand_size": 214
+    },
+    {
+     "x": 16,
+     "recall1": false,
+     "cand_size": 572
+    },
+    {
+     "x": 32,
+     "recall1": false,
+     "cand_size": 1101
+    },
+    {
+     "x": 64,
+     "recall1": false,
+     "cand_size": 2485
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 5971
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 13571
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 30238
+    }
+   ],
+   "\u5149\u5408\u4f5c\u7528\u7684\u8fc7\u7a0b\u662f": [
+    {
+     "x": 8,
+     "recall1": true,
+     "cand_size": 237
+    },
+    {
+     "x": 16,
+     "recall1": true,
+     "cand_size": 468
+    },
+    {
+     "x": 32,
+     "recall1": true,
+     "cand_size": 1027
+    },
+    {
+     "x": 64,
+     "recall1": true,
+     "cand_size": 2467
+    },
+    {
+     "x": 128,
+     "recall1": true,
+     "cand_size": 5808
+    },
+    {
+     "x": 256,
+     "recall1": true,
+     "cand_size": 13970
+    },
+    {
+     "x": 512,
+     "recall1": true,
+     "cand_size": 30017
+    }
+   ]
+  }
+ },
+ "C_proj64": {
+  "kind": "proj",
+  "xs": [
+   256,
+   512,
+   1024,
+   2048,
+   4096,
+   8192,
+   16384,
+   32768
+  ],
+  "per_prompt": {
+   "P1 \u4e2d\u56fd\u7684\u9996\u90fd\u662f": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "P2 The capital of France is": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": true,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": true,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": true,
+     "cand_size": 32768
+    }
+   ],
+   "P3 \u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "The capital of Japan is": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "Python is a programming language used for": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": true,
+     "cand_size": 32768
+    }
+   ],
+   "The largest ocean on Earth is the": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": true,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": true,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": true,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": true,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": true,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": true,
+     "cand_size": 32768
+    }
+   ],
+   "Who invented the telephone?": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": true,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": true,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": true,
+     "cand_size": 32768
+    }
+   ],
+   "\u4eba\u5de5\u667a\u80fd\u7684\u672a\u6765\u53d1\u5c55\u65b9\u5411\u662f": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "\u4e0a\u6d77\u662f\u4e2d\u56fd\u6700\u5927\u7684\u57ce\u5e02": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": true,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": true,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": true,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": true,
+     "cand_size": 32768
+    }
+   ],
+   "\u91cf\u5b50\u8ba1\u7b97\u7684\u57fa\u672c\u539f\u7406\u662f": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "\u5149\u5408\u4f5c\u7528\u7684\u8fc7\u7a0b\u662f": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ]
+  }
+ },
+ "D_norm": {
+  "kind": "norm",
+  "xs": [
+   256,
+   512,
+   1024,
+   2048,
+   4096,
+   8192,
+   16384,
+   32768
+  ],
+  "per_prompt": {
+   "P1 \u4e2d\u56fd\u7684\u9996\u90fd\u662f": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "P2 The capital of France is": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "P3 \u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "The capital of Japan is": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "Python is a programming language used for": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "The largest ocean on Earth is the": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "Who invented the telephone?": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "\u4eba\u5de5\u667a\u80fd\u7684\u672a\u6765\u53d1\u5c55\u65b9\u5411\u662f": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "\u4e0a\u6d77\u662f\u4e2d\u56fd\u6700\u5927\u7684\u57ce\u5e02": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "\u91cf\u5b50\u8ba1\u7b97\u7684\u57fa\u672c\u539f\u7406\u662f": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ],
+   "\u5149\u5408\u4f5c\u7528\u7684\u8fc7\u7a0b\u662f": [
+    {
+     "x": 256,
+     "recall1": false,
+     "cand_size": 256
+    },
+    {
+     "x": 512,
+     "recall1": false,
+     "cand_size": 512
+    },
+    {
+     "x": 1024,
+     "recall1": false,
+     "cand_size": 1024
+    },
+    {
+     "x": 2048,
+     "recall1": false,
+     "cand_size": 2048
+    },
+    {
+     "x": 4096,
+     "recall1": false,
+     "cand_size": 4096
+    },
+    {
+     "x": 8192,
+     "recall1": false,
+     "cand_size": 8192
+    },
+    {
+     "x": 16384,
+     "recall1": false,
+     "cand_size": 16384
+    },
+    {
+     "x": 32768,
+     "recall1": false,
+     "cand_size": 32768
+    }
+   ]
+  }
+ }
+}

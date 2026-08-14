@@ -1,0 +1,42 @@
+{
+ "128": {
+  "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+   "next": 2130,
+   "ref": 2130,
+   "ok": true,
+   "gap": 1.3524188995361328
+  },
+  "The capital of France is": {
+   "next": 12095,
+   "ref": 12095,
+   "ok": true,
+   "gap": 0.96832275390625
+  },
+  "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+   "next": 99366,
+   "ref": 99366,
+   "ok": true,
+   "gap": 0.6518421173095703
+  }
+ },
+ "256": {
+  "\u4e2d\u56fd\u7684\u9996\u90fd\u662f": {
+   "next": 2130,
+   "ref": 2130,
+   "ok": true,
+   "gap": 0.8076953887939453
+  },
+  "The capital of France is": {
+   "next": 12095,
+   "ref": 12095,
+   "ok": true,
+   "gap": 0.5124282836914062
+  },
+  "\u4eca\u5929\u5929\u6c14\u5f88\u597d\uff0c\u6211\u4eec\u53bb\u516c\u56ed": {
+   "next": 99366,
+   "ref": 99366,
+   "ok": true,
+   "gap": 0.23308372497558594
+  }
+ }
+}

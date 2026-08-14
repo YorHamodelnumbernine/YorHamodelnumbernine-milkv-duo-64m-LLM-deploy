@@ -1,0 +1,13 @@
+{
+ "C": 1024,
+ "D": 896,
+ "V": 151936,
+ "Kc": 128,
+ "seed": 7,
+ "recall_all": 11,
+ "recall_P0": 3,
+ "P0_min_cand_gap": 0.4386039246064328,
+ "pass": true,
+ "centroid_bytes": 3670016,
+ "clust_idx_bytes": 8192
+}
