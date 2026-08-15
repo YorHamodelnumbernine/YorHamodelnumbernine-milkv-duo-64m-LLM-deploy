@@ -45,6 +45,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/resource.h>
+#include <signal.h>
+#include <setjmp.h>
 #include "cviruntime_context.h"
 #include "bmkernel/bm1822/bmkernel_1822.h"
 #include "dequant_kal.c"              /* scalar + RVV K-aligned dequant */
@@ -67,7 +69,9 @@
 #define V 151936
 #define MS 7            /* max prompt seq in the 3-prompt regression */
 #define MAX_SEQ 64
-#define KV_CAP 20       /* prefill(<=7) + decode 追加 token 数 (decode 实测用) */
+#define KV_CAP 48       /* prompt + decode 追加 token 数; 2*DKV*L*4B=24KB/token, 20->48 仅 +0.67MB DDR anon (非 ION) */
+                        /* 依据 PLAN_B_NIB_MEMBUDGET_V2: KV cache 是 malloc(DDR 匿名) 不碰 ION carveout;
+                           DDR 运行期余量 ~5-6MiB 可容 +0.67MiB. MAX_SEQ=64 >= KV_CAP=48 (rope/softmax 上限). */
 #define TILEW 512       /* max N-tile width (M>=2 pools: 128/256/384/512) */
 #define MAXT 10         /* ceil(F/TILEW) = 10 */
 #define MTILEW 608      /* Phase 7d: merged up/gate N-tile width (F=4864=8*608) */
@@ -93,6 +97,11 @@
 #define GSC_DN_SZ  ((size_t)((F / G) * D * 2))
 #define GSC_LAYER_BYTES (GSC_WQ_SZ + GSC_WK_SZ + GSC_WV_SZ + GSC_WO_SZ + GSC_UP_SZ + GSC_GA_SZ + GSC_DN_SZ)
 #define GSC_TOTAL_BYTES (GSC_LAYER_BYTES * L)
+/* carveout 预检 margin: pools 实测 ~1.7MB + merged ~0.26MB (各含安全余量).
+ * 用于 gsc/pools 分配前判断 "整轮 ION 足迹" 是否放得下, 避免 gsc 先占满导致
+ * 后续 pools 分配在 SDK 重试路径 SIGABRT. */
+#define ION_POOLS_EST (2u << 20)
+#define ION_MP_EST    (1u << 20)
 #define ROPE_THETA 1000000.0
 #define EPS 1e-6f
 
@@ -155,6 +164,92 @@ static int rsh_lookup(int l, int mi, int dc) {
 static inline double now(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* =====================================================================
+ * ION OOM 防御 (libcviruntime CVI_RT_MemAlloc 失败时不返回 NULL: 反汇编
+ * mem_alloc_raw 证实其重试 3 次 "reopen ion dev" 后 __assert_fail -> SIGABRT,
+ * 直接杀进程, 调用方无法走清理/回退路径).
+ *  1) rt_alloc_safe(): sigsetjmp/siglongjmp 捕获 SIGABRT -> 返回 NULL,
+ *     调用方走既有 NULL 检查 (回退 GSC_ION=0 冷 mmap / 清理退出), 不 SIGABRT.
+ *     assert 前 SDK 已 close 旧 ion fd 且已解锁互斥 (反汇编证实) -> 捕获后
+ *     继续用 SDK 安全; 已分配的其他 buffer (neuron 等) 是独立 dmabuf fd, 不受影响.
+ *  2) watchdog: 主循环 run_prompt/run_decode_step 每层 wd_kick() 打心跳;
+ *     超 WD_TIMEOUT_SEC 无心跳即判定挂死, 强制 _exit(1) 让内核关 fd 释放 ION
+ *     (实测 SIGABRT 本身不泄漏, 24.3MB 泄漏源 = 残留存活/孤儿进程).
+ * ===================================================================== */
+static sigjmp_buf g_ion_abort_jmp;
+static volatile sig_atomic_t g_ion_alloc_armed = 0;
+
+static void ion_abort_sighandler(int sig) {
+    if (g_ion_alloc_armed) siglongjmp(g_ion_abort_jmp, 1);
+    /* 非分配期 SIGABRT = 真实 bug: 恢复默认动作重新 raise, 保持标准 RC=134/core 语义. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static CVI_RT_MEM rt_alloc_safe(CVI_RT_HANDLE rt, size_t sz, const char *what) {
+    g_ion_alloc_armed = 1;
+    CVI_RT_MEM m = NULL;
+    if (sigsetjmp(g_ion_abort_jmp, 1) == 0) {
+        m = CVI_RT_MemAlloc(rt, sz);
+    } else {
+        fprintf(stderr, "[ION-OOM] SIGABRT 在 %s 分配期间被捕获 (sz=%zu B); "
+                        "不退出, 走回退/清理路径. 若为残留占用, 请 run_clean.sh --clean 后重试.\n",
+                what, sz);
+        m = NULL;
+    }
+    g_ion_alloc_armed = 0;
+    return m;
+}
+
+/* ---- watchdog (防孤儿进程 ION 泄漏) ---- */
+#define WD_TIMEOUT_NS (90LL * 1000000000LL)
+static volatile long long g_wd_heartbeat_ns = 0;
+static volatile sig_atomic_t g_wd_enabled = 0;
+static volatile sig_atomic_t g_wd_die = 0;
+static pthread_t g_wd_thread;
+
+static long long wd_now_ns(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+static void wd_kick(void) {
+    if (g_wd_enabled) __atomic_store_n(&g_wd_heartbeat_ns, wd_now_ns(), __ATOMIC_RELAXED);
+}
+static void *wd_thread_main(void *arg) {
+    (void)arg;
+    while (!g_wd_die) {
+        usleep(500000);   /* 0.5s 检查粒度 */
+        long long hb = __atomic_load_n(&g_wd_heartbeat_ns, __ATOMIC_RELAXED);
+        if (g_wd_enabled && (wd_now_ns() - hb) > WD_TIMEOUT_NS) {
+            fprintf(stderr, "[WATCHDOG] %.0fs 无心跳 (>%.0fs), 判定挂死; 强制 _exit(1) "
+                            "让内核释放 ION (防孤儿进程 24MB 泄漏).\n",
+                    (double)(wd_now_ns() - hb) / 1e9, WD_TIMEOUT_NS / 1e9);
+            _exit(1);
+        }
+    }
+    return NULL;
+}
+static void wd_start(void) {
+    __atomic_store_n(&g_wd_heartbeat_ns, wd_now_ns(), __ATOMIC_RELAXED);
+    g_wd_enabled = 1;
+    if (pthread_create(&g_wd_thread, NULL, wd_thread_main, NULL) != 0) {
+        fprintf(stderr, "[WATCHDOG] 线程创建失败, 继续无看门狗运行\n");
+        g_wd_enabled = 0;
+    } else {
+        pthread_detach(g_wd_thread);
+    }
+}
+
+/* 安装 SIGABRT 捕获 (rt_alloc_safe 使用); 必须在任何 CVI_RT_MemAlloc 之前调用. */
+static void ion_abort_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = ion_abort_sighandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGABRT, &sa, NULL);
 }
 
 /* ---------------- host semantic helpers (qwen_kal_ref exact) ---------------- */
@@ -228,8 +323,13 @@ typedef struct {
     CVI_RT_MEM ld[16][2], src[16][2];  /* [rshift][dest 0=P1 1=P2] */
 } Pool;
 
-static void pool_build(CVI_RT_HANDLE rt, uint64_t pa, int M, int nshape, Pool *p) {
+static void pool_free(CVI_RT_HANDLE rt, Pool *p);   /* 前置声明 (定义在 pool_build 之后) */
+
+/* 返回 0 OK / -1 失败 (ION 分配失败: 已打印错误, 部分已分配已释放, 不泄漏). */
+static int pool_build(CVI_RT_HANDLE rt, uint64_t pa, int M, int nshape, Pool *p) {
     p->nshape = nshape;
+    memset(p->ld, 0, sizeof p->ld);
+    memset(p->src, 0, sizeof p->src);
     bmk1822_matrix_lmem_shape_t SL = {.n = (uint32_t)M, .c = 1, .w = 32, .col = 32};
     bmk1822_matrix_lmem_shape_t SR = {.n = 32, .c = 1, .w = (uint32_t)nshape, .col = (uint32_t)nshape};
     bmk1822_matrix_lmem_shape_t SO = {.n = (uint32_t)M, .c = 1, .w = (uint32_t)nshape, .col = (uint32_t)nshape};
@@ -255,7 +355,14 @@ static void pool_build(CVI_RT_HANDLE rt, uint64_t pa, int M, int nshape, Pool *p
             bmk1822_tdma_l2g_matrix_copy(bmk, &(bmk1822_tdma_l2tg_matrix_copy_param_t){ml_o, &mg_o});
             uint32_t cmd_sz; uint8_t *cmd = bmk1822_acquire_cmdbuf(bmk, &cmd_sz);
             uint32_t psize, pmu; bmk1822_dmabuf_size(cmd, cmd_sz, &psize, &pmu);
-            p->src[r][dest] = CVI_RT_MemAlloc(rt, psize);
+            p->src[r][dest] = rt_alloc_safe(rt, psize, "pool");
+            if (!p->src[r][dest]) {
+                fprintf(stderr, "pool ION alloc %u B FAILED (M=%d n=%d r=%d d=%d); carveout 余量不足 — "
+                                "run 'run_clean.sh --clean' 清理遗留后重试\n",
+                        psize, M, nshape, r, dest);
+                pool_free(rt, p);
+                return -1;
+            }
             uint8_t *db = CVI_RT_MemGetVAddr(p->src[r][dest]);
             bmk1822_dmabuf_convert(cmd, cmd_sz, db);
             bmk1822_arraybase_set(db, pa, 0, 0, 0);
@@ -264,6 +371,7 @@ static void pool_build(CVI_RT_HANDLE rt, uint64_t pa, int M, int nshape, Pool *p
             bmk1822_cleanup(bmk);
         }
     }
+    return 0;
 }
 
 /* ---- Phase 7d: merged N-tile cmdbuf (up/gate, M=1) ----
@@ -277,8 +385,11 @@ typedef struct {
     CVI_RT_MEM ld[16][2], src[16][2];   /* [rshift][dest 0=P1 1=P2] */
 } MergedPool;
 
-static void mpool_build(CVI_RT_HANDLE rt, uint64_t pa, int M, int tilew, int nt, MergedPool *mp) {
+/* 返回 0 OK / -1 失败 (ION 分配失败: 已打印错误, 部分已分配已释放, 不泄漏). */
+static int mpool_build(CVI_RT_HANDLE rt, uint64_t pa, int M, int tilew, int nt, MergedPool *mp) {
     mp->nt = nt; mp->tilew = tilew;
+    memset(mp->ld, 0, sizeof mp->ld);
+    memset(mp->src, 0, sizeof mp->src);
     for (int r = 0; r < 16; r++) {
         for (int dest = 0; dest < 2; dest++) {
             uint32_t ooff = dest ? P2_OFF : P1_OFF;
@@ -318,7 +429,16 @@ static void mpool_build(CVI_RT_HANDLE rt, uint64_t pa, int M, int tilew, int nt,
             }
             uint32_t cmd_sz; uint8_t *cmd = bmk1822_acquire_cmdbuf(bmk, &cmd_sz);
             uint32_t psize, pmu; bmk1822_dmabuf_size(cmd, cmd_sz, &psize, &pmu);
-            mp->src[r][dest] = CVI_RT_MemAlloc(rt, psize);
+            mp->src[r][dest] = rt_alloc_safe(rt, psize, "merged-pool");
+            if (!mp->src[r][dest]) {
+                fprintf(stderr, "merged pool ION alloc %u B FAILED (r=%d d=%d); carveout 余量不足 — "
+                                "run 'run_clean.sh --clean' 清理遗留后重试, 或 MERGE=0 关闭 merged pool\n",
+                        psize, r, dest);
+                for (int rr = 0; rr < 16; rr++)
+                    for (int dd = 0; dd < 2; dd++)
+                        if (mp->src[rr][dd]) { CVI_RT_MemFree(rt, mp->src[rr][dd]); mp->src[rr][dd] = NULL; }
+                return -1;
+            }
             uint8_t *db = CVI_RT_MemGetVAddr(mp->src[r][dest]);
             bmk1822_dmabuf_convert(cmd, cmd_sz, db);
             bmk1822_arraybase_set(db, pa, 0, 0, 0);
@@ -327,6 +447,7 @@ static void mpool_build(CVI_RT_HANDLE rt, uint64_t pa, int M, int tilew, int nt,
             bmk1822_cleanup(bmk);
         }
     }
+    return 0;
 }
 
 /* Per-M pool set.  Only the widths actually used per M are built:
@@ -713,17 +834,74 @@ static int gsc_layer_load(int fd, uint8_t *dst) {
     return 0;
 }
 
-/* 24 层全 ION (GSC_ION=1 路径, 非 ion_db). */
+/* ---- ION carveout 预检 (GSC_ION=1 OOM/泄漏 稳健性) ----
+ * 直读 ION debugfs summary: "[0] carveout heap size:<sz> bytes, used:<u> bytes".
+ * 返回当前空闲字节数; 文件不可用返回 -1 (调用方跳过预检, 退化为 MemAlloc NULL 检查).
+ * 目的: 在进入 libcviruntime mem_alloc_raw 的 "reopen ion dev 重试->assert" 路径
+ * 之前拦截空间不足, 避免 SIGABRT + 退出不释放把已有 ION 全量泄漏 (实测 24.3MB). */
+static long long ion_carveout_free(void) {
+    FILE *f = fopen("/sys/kernel/debug/ion/cvi_carveout_heap_dump/summary", "r");
+    if (!f) return -1;
+    long long size = 0, used = -1;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "[%*d] carveout heap size:%lld bytes, used:%lld bytes", &size, &used) == 2) break;
+    }
+    fclose(f);
+    if (size <= 0 || used < 0 || used > size) return -1;
+    return size - used;
+}
+
+/* 预检诊断: 打印当前 carveout used/free/peak 供 OOM 排障. */
+static void ion_carveout_report(const char *tag) {
+    FILE *f = fopen("/sys/kernel/debug/ion/cvi_carveout_heap_dump/summary", "r");
+    if (!f) { printf("  [%s] ion summary unavailable\n", tag); return; }
+    char line[256];
+    while (fgets(line, sizeof line, f)) { line[strcspn(line, "\n")] = 0; printf("  [%s] %s\n", tag, line); }
+    fclose(f);
+}
+
+/* 24 层全 ION (GSC_ION=1 路径, 非 ion_db).
+ * 分级降级 (CEO 建议: 空间不够时 gsc 缓存降为部分层):
+ *   Tier 1: 24 层全 ION (free >= 24层 + pools/mp 足迹)
+ *   Tier 2: 22 层 ION + 2 层 DDR mmap (free >= 22层 + pools/mp 足迹)  — 复用 B-2 混合缓存
+ *   Tier 3: 全冷 mmap (GSC_ION=0, 稳定基线)
+ * 任何一级失败都走 rt_alloc_safe/预检, 绝不进入 SDK 重试->SIGABRT 路径. */
 static int gsc_ion_load(CVI_RT_HANDLE rt) {
-    g_gsc_ion_mem = CVI_RT_MemAlloc(rt, GSC_TOTAL_BYTES);
+    long long free_ion = ion_carveout_free();
+    long long pools_need = (long long)ION_POOLS_EST
+                         + (g_use_merged ? (long long)ION_MP_EST : 0);
+    long long need24 = (long long)GSC_TOTAL_BYTES + pools_need;
+    long long need22 = (long long)GSC_ION_CACHE_BYTES + pools_need;
+    int ion_layers = L;
+    size_t ion_bytes = GSC_TOTAL_BYTES;
+
+    if (free_ion >= 0 && free_ion < need24) {
+        if (free_ion >= need22) {
+            fprintf(stderr, "GSC_ION pre-check: carveout free=%lld B < 24层需 %lld B; "
+                            "降级 %d 层 ION + %d 层 DDR mmap (Tier 2, 留足 pools/mp 余量)\n",
+                    free_ion, need24, GSC_ION_LAYERS, GSC_DDR_LAYERS);
+            ion_layers = GSC_ION_LAYERS;
+            ion_bytes = GSC_ION_CACHE_BYTES;
+        } else {
+            fprintf(stderr, "GSC_ION pre-check FAIL: carveout free=%lld B < 22层需 %lld B; "
+                            "fallback to cold mmap gsc reads (GSC_ION=0, Tier 3).\n"
+                            "  If a prior failed run leaked ION, run 'run_clean.sh --clean' first.\n",
+                    free_ion, need22);
+            g_gsc_ion = NULL;
+            return -1;
+        }
+    }
+
+    g_gsc_ion_mem = rt_alloc_safe(rt, ion_bytes, "gsc");
     if (!g_gsc_ion_mem) {
-        fprintf(stderr, "GSC ION alloc %zu B FAILED -> fallback to cold mmap gsc reads\n", (size_t)GSC_TOTAL_BYTES);
+        fprintf(stderr, "GSC ION alloc %zu B FAILED -> fallback to cold mmap gsc reads\n", ion_bytes);
         g_gsc_ion = NULL;
         return -1;
     }
     uint8_t *base = CVI_RT_MemGetVAddr(g_gsc_ion_mem);
     uint8_t *dst = base;
-    for (int l = 0; l < L; l++, dst += GSC_LAYER_BYTES) {
+    for (int l = 0; l < ion_layers; l++, dst += GSC_LAYER_BYTES) {
         char path[160]; snprintf(path, sizeof path, "%s/layer%d_kal.bin", WDIR, l);
         int fd = open(path, O_RDONLY);
         if (fd < 0) { fprintf(stderr, "gsc open %s\n", path); CVI_RT_MemFree(rt, g_gsc_ion_mem); g_gsc_ion_mem = NULL; return -1; }
@@ -736,9 +914,41 @@ static int gsc_ion_load(CVI_RT_HANDLE rt) {
     }
     /* CPU-only reads: ION is CPU-cached, no flush/invld needed. */
     g_gsc_ion = (uint16_t *)base;
-    g_gsc_ion_n = L;
-    printf("GSC_ION: cached %zu B/layer x%d = %.2f MiB in ION\n", (size_t)GSC_LAYER_BYTES, L,
-           (double)GSC_TOTAL_BYTES / 1048576.0);
+    g_gsc_ion_n = ion_layers;
+
+    /* Tier 2: 剩余层 DDR mmap + 预读入 page cache (与 B-2 同机制, decode 期 0 页错误). */
+    size_t ddlen[GSC_DDR_LAYERS] = {0};   /* 每个 DDR 层 mmap 长度 (失败回收用; 均等于层文件大小) */
+    for (int i = 0; i < GSC_DDR_LAYERS; i++) {
+        int l = ion_layers + i;
+        char path[160]; snprintf(path, sizeof path, "%s/layer%d_kal.bin", WDIR, l);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { fprintf(stderr, "gsc DDR open %s failed\n", path); goto ddr_err; }
+        struct stat st2;
+        if (fstat(fd, &st2) != 0 || st2.st_size <= 0) { fprintf(stderr, "gsc DDR fstat %s failed\n", path); close(fd); goto ddr_err; }
+        void *mp = mmap(NULL, (size_t)st2.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mp == MAP_FAILED) { fprintf(stderr, "gsc DDR mmap %s failed\n", path); close(fd); goto ddr_err; }
+        g_gsc_ddr_map[i] = (uint8_t *)mp;
+        ddlen[i] = (size_t)st2.st_size;
+        uint8_t *gb = (uint8_t *)mp + GSC_WQ_OFF;
+        size_t glen = GSC_DN_OFF + GSC_DN_SZ - GSC_WQ_OFF;
+        madvise(gb, glen, MADV_WILLNEED);
+        for (size_t off = 0; off < glen; off += 4096) (void)gb[off];
+        (void)gb[glen - 1];
+        close(fd);
+        continue;
+    ddr_err:
+        /* DDR 层 mmap 失败: 回收已映射的 DDR 层 + 已分配 ION, 整体回退 Tier 3 冷 mmap. */
+        for (int j = 0; j < i; j++) { if (g_gsc_ddr_map[j]) { munmap(g_gsc_ddr_map[j], ddlen[j]); g_gsc_ddr_map[j] = NULL; } }
+        CVI_RT_MemFree(rt, g_gsc_ion_mem); g_gsc_ion_mem = NULL;
+        g_gsc_ion = NULL; g_gsc_ion_n = 0;
+        fprintf(stderr, "GSC_ION DDR layer fallback FAILED -> cold mmap gsc reads (Tier 3)\n");
+        return -1;
+    }
+
+    printf("GSC_ION: cached %zu B/layer x%d = %.2f MiB in ION",
+           (size_t)GSC_LAYER_BYTES, ion_layers, (double)ion_bytes / 1048576.0);
+    if (ion_layers < L) printf(" + %d DDR layers (mmap)", GSC_DDR_LAYERS);
+    printf("\n");
     return 0;
 }
 
@@ -747,7 +957,14 @@ static int gsc_ion_load(CVI_RT_HANDLE rt) {
  * RAM 已实测 crash); 省出的 ~1.86MB ION 用于第 3 个 SD 大槽. prefill/回归已触碰全部
  * gsc → decode 期间全 page-cache hit. */
 static int gsc_cache_load_b2(CVI_RT_HANDLE rt, size_t lsz) {
-    g_gsc_ion_mem = CVI_RT_MemAlloc(rt, GSC_ION_CACHE_BYTES);
+    /* 分配前预检: 空间不足时干净报错返回, 不触发 SDK assert/泄漏. */
+    long long free_ion = ion_carveout_free();
+    if (free_ion >= 0 && free_ion < (long long)GSC_ION_CACHE_BYTES) {
+        fprintf(stderr, "B-2 gsc pre-check FAIL: carveout free=%lld B < needed=%zu B\n",
+                free_ion, (size_t)GSC_ION_CACHE_BYTES);
+        return -1;
+    }
+    g_gsc_ion_mem = rt_alloc_safe(rt, GSC_ION_CACHE_BYTES, "b2-gsc");
     if (!g_gsc_ion_mem) {
         fprintf(stderr, "B-2 gsc ION alloc %zu B FAILED (carveout 余量不足?)\n", (size_t)GSC_ION_CACHE_BYTES);
         return -1;
@@ -1338,6 +1555,41 @@ static void attention_cached(int pos, const float *qbuf, const float *k, const f
     }
 }
 
+/* CHAT 泛化 prefill 用: 每个 chunk token 对「已缓存 KV(0..gpos-1) + 本 chunk kbuf/vbuf」做因果 attention.
+ * gpos = 本 chunk 首 token 的全局位置 (进入本 chunk 前的 g_kv_len). 输出 attn[cs][D].
+ * gpos==0 时退化为满序列因果 (与现有 attention 逐位一致, 保持回归 bit-exact). */
+static void attention_ext(int cs, int gpos,
+                          const float *qbuf, const float *kbuf, const float *vbuf,
+                          const float *kcache, const float *vcache, float *attn) {
+    for (int hh = 0; hh < H; hh++) {
+        int kvh = hh / GROUPS;
+        for (int m = 0; m < cs; m++) {
+            const float *qm = qbuf + (size_t)m * D + (size_t)hh * HD;
+            int len = gpos + m + 1;   /* 该 token 的完整上下文长度 (0..gpos+m) */
+            float lgm[MAX_SEQ], mx = -1e30f;
+            for (int s = 0; s < len; s++) {
+                const float *ks = (s < gpos) ? kcache + (size_t)kvh * HD + (size_t)s * DKV
+                                             : kbuf   + (size_t)kvh * HD + (size_t)(s - gpos) * DKV;
+                float v = 0; for (int j = 0; j < HD; j++) v += qm[j] * ks[j];
+                v *= 1.0f / sqrtf((float)HD);
+                lgm[s] = v; if (v > mx) mx = v;
+            }
+            float sum = 0;
+            for (int s = 0; s < len; s++) { lgm[s] = expf(lgm[s] - mx); sum += lgm[s]; }
+            float *attrow = attn + (size_t)m * D + (size_t)hh * HD;
+            for (int j = 0; j < HD; j++) {
+                float acc = 0;
+                for (int s = 0; s < len; s++) {
+                    const float *vs = (s < gpos) ? vcache + (size_t)kvh * HD + (size_t)s * DKV
+                                                 : vbuf   + (size_t)kvh * HD + (size_t)(s - gpos) * DKV;
+                    acc += lgm[s] / sum * vs[j];
+                }
+                attrow[j] = acc;
+            }
+        }
+    }
+}
+
 /* ---------------- buffers ---------------- */
 static float x[MS * D], h[MS * D], qbuf[MS * D], kbuf[MS * DKV], vbuf[MS * DKV], attn[MS * D];
 
@@ -1503,7 +1755,8 @@ static void run_prompt(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uint8_t *v
                        const float (*bias_all)[D + DKV + DKV],
                        PoolSet *ps, size_t lsz,
                        int *bad1, int *bad2, int *rbad,
-                       double *t_layers, double *t_head, int *next_token) {
+                       double *t_layers, double *t_head, int *next_token,
+                       int gpos, int do_head) {
     /* ---- x = embed[t]*esc[t] (streamed single rows) ---- */
     {
         FILE *ef = fopen(EMBED_PATH, "rb");
@@ -1521,6 +1774,7 @@ static void run_prompt(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uint8_t *v
 
     double t0 = now();
     for (int l = 0; l < L; l++) {
+        wd_kick();   /* watchdog 心跳: 每层打点, 挂死时强制退出防 ION 孤儿泄漏 */
         g_cur_layer = l; g_cur_dchunk = 0;   /* Phase 7c: rsafe 查表定位 (layer, matrix) */
         /* 层权重读路径: mmap / mmap+readahead / pread / ion_db (Phase 7, LW_READ) */
         LayerIO lio;
@@ -1545,16 +1799,21 @@ static void run_prompt(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uint8_t *v
             for (int j = 0; j < DKV; j++) { kbuf[(size_t)m * DKV + j] += bk[j]; vbuf[(size_t)m * DKV + j] += bv[j]; }
         }
         for (int m = 0; m < seq; m++) {
-            for (int hh = 0; hh < H; hh++) rope_inplace(qbuf + (size_t)m * D + (size_t)hh * HD, m, cosb, sinb);
-            for (int hh = 0; hh < KVH; hh++) rope_inplace(kbuf + (size_t)m * DKV + (size_t)hh * HD, m, cosb, sinb);
+            for (int hh = 0; hh < H; hh++) rope_inplace(qbuf + (size_t)m * D + (size_t)hh * HD, gpos + m, cosb, sinb);
+            for (int hh = 0; hh < KVH; hh++) rope_inplace(kbuf + (size_t)m * DKV + (size_t)hh * HD, gpos + m, cosb, sinb);
         }
-        /* ---- KV cache capture (decode 实测): 每层 rope 后存 kbuf/vbuf ---- */
+        /* ---- KV cache capture (CHAT: 写绝对位置 gpos+m) ---- */
         for (int m = 0; m < seq; m++) {
-            memcpy(g_kvk + (size_t)(l * KV_CAP + m) * DKV, kbuf + (size_t)m * DKV, DKV * sizeof(float));
-            memcpy(g_kvv + (size_t)(l * KV_CAP + m) * DKV, vbuf + (size_t)m * DKV, DKV * sizeof(float));
+            memcpy(g_kvk + (size_t)(l * KV_CAP + gpos + m) * DKV, kbuf + (size_t)m * DKV, DKV * sizeof(float));
+            memcpy(g_kvv + (size_t)(l * KV_CAP + gpos + m) * DKV, vbuf + (size_t)m * DKV, DKV * sizeof(float));
         }
-        g_kv_len = seq;
-        attention(seq, qbuf, kbuf, vbuf, attn);
+        g_kv_len = gpos + seq;
+        if (gpos == 0)
+            attention(seq, qbuf, kbuf, vbuf, attn);
+        else
+            attention_ext(seq, gpos, qbuf, kbuf, vbuf,
+                          g_kvk + (size_t)l * KV_CAP * DKV,
+                          g_kvv + (size_t)l * KV_CAP * DKV, attn);
 
         /* ---- wo ---- */
         per_row_quant(attn, seq, D, ai, sca);
@@ -1593,33 +1852,39 @@ static void run_prompt(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uint8_t *v
      * pass 基址前移 — 下一 forward 首矩阵 q(0) 由冷槽同步补载, ~18ms/step, 可忽略. */
     if (g_lw_mode == LW_ION_DB) { ion_drain(); g_pass_base += L * NMAT; }
 
-    /* ---- LM head: final rms -> two-stage (Stage1 h·centroid, Stage2 spans) ---- */
-    double t1 = now();
-    rms_norm(x + (size_t)(seq - 1) * D, 1, frms, D, h);
-    double t_rms = now() - t1;
-    int top[5]; double tv[5]; size_t cand_rows; double gap;
-    int sel[LMHEAD_KC];
-    t1 = now();
-    lmhead_stage1(h, LMHEAD_KC, sel);
-    double t_s1 = now() - t1;
-    t1 = now();
-    lmhead_stage2(h, sel, LMHEAD_KC, top, tv, &cand_rows, &gap);
-    double t_s2 = now() - t1;
-    *t_head = t_rms + t_s1 + t_s2;
-    *next_token = top[0];
+    /* ---- LM head: final rms -> two-stage (Stage1 h·centroid, Stage2 spans) ----
+     * CHAT chunked prefill: 仅最后一个 chunk 需要 head (do_head=1); 中间 chunk 跳过. */
+    if (do_head) {
+        double t1 = now();
+        rms_norm(x + (size_t)(seq - 1) * D, 1, frms, D, h);
+        double t_rms = now() - t1;
+        int top[5]; double tv[5]; size_t cand_rows; double gap;
+        int sel[LMHEAD_KC];
+        t1 = now();
+        lmhead_stage1(h, LMHEAD_KC, sel);
+        double t_s1 = now() - t1;
+        t1 = now();
+        lmhead_stage2(h, sel, LMHEAD_KC, top, tv, &cand_rows, &gap);
+        double t_s2 = now() - t1;
+        *t_head = t_rms + t_s1 + t_s2;
+        *next_token = top[0];
 
-    printf("LMHEAD2 total=%.3fs (s1=%.3fs [dot=%.3fs] s2=%.3fs [sd=%.3fs cpu=%.3fs] cand=%zu VmSwap=%ldkB)\n",
-           *t_head, t_s1, g_t_dot, t_s2, g_t_sd, g_t_cpu, cand_rows, vmswap_kb());
-    printf("PROMPT %d (seq=%d, toks=[%d %d %d %d %d %d %d])\n",
-           pid + 1, seq, toks[0], toks[1], toks[2], toks[3], toks[4], toks[5], toks[6]);
-    printf("NEXT_TOKEN: %d\n", top[0]);
-    printf("TOP5: ");
-    for (int i = 0; i < 5; i++) printf("%d ", top[i]);
-    printf("\n");
-    printf("GAP: %.4f\n", (double)(tv[0] - tv[1]));
-    for (int i = 0; i < 5; i++) printf("TOPVAL[%d]=%.4f\n", top[i], tv[i]);
-    printf("t_layers=%.2fs t_lmhead=%.2fs t_total=%.2fs per_token=%.2fs\n",
-           *t_layers, *t_head, *t_layers + *t_head, (*t_layers + *t_head) / seq);
+        printf("LMHEAD2 total=%.3fs (s1=%.3fs [dot=%.3fs] s2=%.3fs [sd=%.3fs cpu=%.3fs] cand=%zu VmSwap=%ldkB)\n",
+               *t_head, t_s1, g_t_dot, t_s2, g_t_sd, g_t_cpu, cand_rows, vmswap_kb());
+        printf("PROMPT %d (seq=%d, toks=[%d %d %d %d %d %d %d])\n",
+               pid + 1, seq, toks[0], toks[1], toks[2], toks[3], toks[4], toks[5], toks[6]);
+        printf("NEXT_TOKEN: %d\n", top[0]);
+        printf("TOP5: ");
+        for (int i = 0; i < 5; i++) printf("%d ", top[i]);
+        printf("\n");
+        printf("GAP: %.4f\n", (double)(tv[0] - tv[1]));
+        for (int i = 0; i < 5; i++) printf("TOPVAL[%d]=%.4f\n", top[i], tv[i]);
+        printf("t_layers=%.2fs t_lmhead=%.2fs t_total=%.2fs per_token=%.2fs\n",
+               *t_layers, *t_head, *t_layers + *t_head, (*t_layers + *t_head) / seq);
+    } else {
+        *t_head = 0; *next_token = -1;
+        printf("  CHUNK gpos=%d seq=%d done (kv_len=%d)\n", gpos, seq, g_kv_len);
+    }
 }
 
 /* ---------------- decode 实测: 单 token 前向 (KV cache + M=1) ----------------
@@ -1651,6 +1916,7 @@ static double run_decode_step(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uin
 
     double t0 = now();
     for (int l = 0; l < L; l++) {
+        wd_kick();   /* watchdog 心跳: 每层打点, 挂死时强制退出防 ION 孤儿泄漏 */
         g_cur_layer = l; g_cur_dchunk = 0;   /* Phase 7c: rsafe 查表定位 (layer, matrix) */
         /* 层权重读路径: mmap / mmap+readahead / pread / ion_db (Phase 7, LW_READ) */
         LayerIO lio;
@@ -1795,10 +2061,23 @@ static const int P3_TOKS[MS] = {100644, 104307, 101243, 3837, 97639, 85336, 1020
 static const int PSEQ[3] = {3, 5, 7};
 static const int EXPECTED_NEXT[3] = {2130, 12095, 99366};
 
+/* ---- ION 失败路径统一清理: 先 free 已分配 chunk 再退出 (不把 ION 留给进程存活期).
+ * 仅用于 ION 分配失败等早退路径; 进程正常退出时内核也会关闭 fd 释放 ION, 这里显式
+ * free 是双保险, 并避免 SDK 内部 "reopen ion dev 重试" 挂死期间占用. */
+static void ion_cleanup_exit(CVI_RT_HANDLE rt, CVI_RT_MEM mem) {
+    if (g_gsc_ion_mem) { CVI_RT_MemFree(rt, g_gsc_ion_mem); g_gsc_ion_mem = NULL; }
+    for (int s = 0; s < SD_NSLOT; s++) {
+        if (g_sd_ion[s]) { CVI_RT_MemFree(rt, g_sd_ion[s]); g_sd_ion[s] = NULL; }
+    }
+    if (mem) CVI_RT_MemFree(rt, mem);
+    CVI_RT_DeInit(rt);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     printf("===== M2 24-layer prefill + LM head (TIU Path A', 3-prompt regression) =====\n");
+    ion_abort_install();   /* 捕获 CVI_RT_MemAlloc 的 SIGABRT -> rt_alloc_safe 回退, 不杀进程 */
 
     /* ---- small weights: embed_scales, final_rms, all biases ---- */
     float *esc = malloc(V * sizeof(float));
@@ -1838,7 +2117,13 @@ int main(void) {
 
     /* ---- ION + prebuilt pools (per M, exact tile widths) ---- */
     CVI_RT_HANDLE rt; CVI_RT_Init(&rt);
-    CVI_RT_MEM mem = CVI_RT_MemAlloc(rt, NEURON_SZ);
+    ion_carveout_report("start");   /* 启动基线: used/free/peak 诊断 (OOM 排障) */
+    CVI_RT_MEM mem = rt_alloc_safe(rt, NEURON_SZ, "neuron");
+    if (!mem) {
+        fprintf(stderr, "neuron ION alloc %u B FAILED; carveout 已满?\n", (unsigned)NEURON_SZ);
+        ion_carveout_report("neuron-fail");
+        CVI_RT_DeInit(rt); return 2;
+    }
     uint64_t pa = CVI_RT_MemGetPAddr(mem);
     uint8_t *va = CVI_RT_MemGetVAddr(mem);
     CVI_RT_SetBaseReg(rt, 0, pa);
@@ -1852,32 +2137,39 @@ int main(void) {
     int lw_ion_db = (lw0 && !strcmp(lw0, "ion_db"));
     /* ---- layer 文件大小 (提前, B-2 的 rms_cache_load/SD_BUF 初始化需要) ---- */
     struct stat st;
-    if (stat(WDIR "/layer0_kal.bin", &st)) { fprintf(stderr, "stat layer0\n"); return 2; }
+    if (stat(WDIR "/layer0_kal.bin", &st)) {
+        fprintf(stderr, "stat layer0\n"); ion_cleanup_exit(rt, mem); return 2;
+    }
     size_t lsz = (size_t)st.st_size;
     printf("layer file size = %zu B\n", lsz);
     if (lw_ion_db) {
         double tg = now();
         if (gsc_cache_load_b2(rt, lsz) != 0) {
             fprintf(stderr, "B-2 gsc cache load FAILED — carveout 余量不足或文件缺失\n");
-            return 2;
+            ion_cleanup_exit(rt, mem); return 2;
         }
         printf("B-2 gsc cache load done in %.3fs\n", now() - tg);
         /* B-2: SD_BUF 槽紧跟 gsc 分配 (先于 pool/mp 的碎片化小分配), 保证 2.18MB
          * 大块连续可分配. 2 槽全大槽 (2.18MB), per-matrix 双缓冲, 全 ION. */
         lsz_global = lsz;
-        if (rms_cache_load(lsz) != 0) { fprintf(stderr, "rms cache load FAILED\n"); return 2; }
+        if (rms_cache_load(lsz) != 0) {
+            fprintf(stderr, "rms cache load FAILED\n"); ion_cleanup_exit(rt, mem); return 2;
+        }
         g_bounce_sz = SD_BOUNCE_SZ;
-        if (posix_memalign((void **)&g_bounce, 4096, g_bounce_sz)) { fprintf(stderr, "oom bounce\n"); return 2; }
+        if (posix_memalign((void **)&g_bounce, 4096, g_bounce_sz)) {
+            fprintf(stderr, "oom bounce\n"); ion_cleanup_exit(rt, mem); return 2;
+        }
         for (int s = 0; s < SD_NSLOT; s++) {
             size_t sz = SD_BUF_SZ;
-            g_sd_ion[s] = CVI_RT_MemAlloc(rt, sz);
+            g_sd_ion[s] = rt_alloc_safe(rt, sz, "sd_buf");
             if (!g_sd_ion[s]) {
-                fprintf(stderr, "B-2 SD_BUF%d ION alloc %zu B FAILED (carveout 余量不足?)\n", s, sz); return 2;
+                fprintf(stderr, "B-2 SD_BUF%d ION alloc %zu B FAILED (carveout 余量不足?)\n", s, sz);
+                ion_cleanup_exit(rt, mem); return 2;
             }
             g_sd_va[s] = CVI_RT_MemGetVAddr(g_sd_ion[s]);
         }
         if (pthread_create(&g_pf_thread, NULL, ion_prefetch_thread, NULL) != 0) {
-            fprintf(stderr, "ion pf thread create failed\n"); return 2;
+            fprintf(stderr, "ion pf thread create failed\n"); ion_cleanup_exit(rt, mem); return 2;
         }
         printf("  [LW_ION_DB] SD_NSLOT=%d SD_BUF big=%d B x%d (ION, per-matrix 双缓冲), queue=%d, bounce=%zu B, gsc ION=%d/DDR=%d\n",
                SD_NSLOT, SD_BUF_SZ, SD_NSLOT, SD_QCAP, g_bounce_sz,
@@ -1889,27 +2181,51 @@ int main(void) {
         if (gsc_ion_load(rt) == 0) printf("GSC_ION load done in %.3fs\n", now() - tg);
     }
 
+    /* pool/mp 分配前预检: 非 gsc 部分需 ~1.9MB (实测 pools 1.70MB + mp 0.26MB).
+     * 空间不足先关 merged pool (省 ~0.26MB), 再不足则干净报错退出 (不触发 SDK assert/泄漏). */
     PoolSet ps1, ps3, ps5, ps7; memset(&ps1, 0, sizeof ps1);
     memset(&ps3, 0, sizeof ps3); memset(&ps5, 0, sizeof ps5); memset(&ps7, 0, sizeof ps7);
+    {
+        long long free_ion = ion_carveout_free();
+        long long need = (long long)ION_POOLS_EST + (g_use_merged ? (long long)ION_MP_EST : 0);
+        if (free_ion >= 0 && free_ion < need) {
+            if (g_use_merged) {
+                fprintf(stderr, "carveout pre-check: free=%lld B < pools+mp %lld B; disable merged pool\n",
+                        free_ion, need);
+                g_use_merged = 0;
+                need = (long long)ION_POOLS_EST;
+            }
+            if (free_ion < need) {
+                fprintf(stderr, "carveout pre-check FAIL: free=%lld B < pools need %lld B; "
+                                "run 'run_clean.sh --clean' 清理遗留后重试\n", free_ion, need);
+                CVI_RT_MemFree(rt, mem); CVI_RT_DeInit(rt);
+                return 2;
+            }
+        }
+    }
     double t0 = now();
-    pool_build(rt, pa, 1, 128, &ps1.p128);
-    pool_build(rt, pa, 1, 384, &ps1.p384);
-    pool_build(rt, pa, 1, 896, &ps1.p896);
-    pool_build(rt, pa, 3, 128, &ps3.p128);
-    pool_build(rt, pa, 3, 384, &ps3.p384);
-    pool_build(rt, pa, 3, 896, &ps3.p896);
-    pool_build(rt, pa, 5, 128, &ps5.p128);
-    pool_build(rt, pa, 5, 256, &ps5.p256);
-    pool_build(rt, pa, 5, 768, &ps5.p768);
-    pool_build(rt, pa, 7, 128, &ps7.p128);
-    pool_build(rt, pa, 7, 256, &ps7.p256);
-    pool_build(rt, pa, 7, 768, &ps7.p768);
+    if (pool_build(rt, pa, 1, 128, &ps1.p128) || pool_build(rt, pa, 1, 384, &ps1.p384) ||
+        pool_build(rt, pa, 1, 896, &ps1.p896) || pool_build(rt, pa, 3, 128, &ps3.p128) ||
+        pool_build(rt, pa, 3, 384, &ps3.p384) || pool_build(rt, pa, 3, 896, &ps3.p896) ||
+        pool_build(rt, pa, 5, 128, &ps5.p128) || pool_build(rt, pa, 5, 256, &ps5.p256) ||
+        pool_build(rt, pa, 5, 768, &ps5.p768) || pool_build(rt, pa, 7, 128, &ps7.p128) ||
+        pool_build(rt, pa, 7, 256, &ps7.p256) || pool_build(rt, pa, 7, 768, &ps7.p768)) {
+        fprintf(stderr, "pools build FAILED (ION); freeing partial + exit\n");
+        pool_set_free(rt, &ps1); pool_set_free(rt, &ps3);
+        pool_set_free(rt, &ps5); pool_set_free(rt, &ps7);
+        CVI_RT_MemFree(rt, mem); CVI_RT_DeInit(rt);
+        return 2;
+    }
     printf("pools built (M=1:{128,384,896} M=3:{128,384,896} M=5/7:{128,256,768}) in %.3fs\n", now() - t0);
     MergedPool mp; memset(&mp, 0, sizeof mp);
     if (g_use_merged) {
         double tm = now();
-        mpool_build(rt, pa, 1, MTILEW, MNT, &mp);
-        printf("merged pool built (M=1 up/gate: %d tiles x %d, F=%d) in %.3fs\n", MNT, MTILEW, MNT * MTILEW, now() - tm);
+        if (mpool_build(rt, pa, 1, MTILEW, MNT, &mp) != 0) {
+            fprintf(stderr, "merged pool build FAILED; continue without mp (MERGE=0 fallback)\n");
+            g_use_merged = 0;
+        } else {
+            printf("merged pool built (M=1 up/gate: %d tiles x %d, F=%d) in %.3fs\n", MNT, MTILEW, MNT * MTILEW, now() - tm);
+        }
     }
 
     /* ---- KV cache (decode 实测): [L][KV_CAP][DKV] fp32 ---- */
@@ -1983,26 +2299,30 @@ int main(void) {
     }
 
     int bad1 = 0, bad2 = 0, rbad = 0;
-    const int *PT[3] = {P1_TOKS, P2_TOKS, P3_TOKS};
-    int ok_all = 1;
-    double tot_all = now();
-    for (int p = 0; p < 3; p++) {
-        double tl, th; int nxt;
-        PoolSet *ps = (PSEQ[p] <= 3) ? &ps3 : (PSEQ[p] <= 5) ? &ps5 : &ps7;
-        run_prompt(rt, mem, pa, va, PT[p], PSEQ[p], p, esc, frms, bias_all,
-                   ps, lsz, &bad1, &bad2, &rbad, &tl, &th, &nxt);
-        int ok = (nxt == EXPECTED_NEXT[p]);
-        ok_all &= ok;
-        printf("  expected_next=%d  %s\n", EXPECTED_NEXT[p], ok ? "OK" : "MISMATCH");
+    wd_start();   /* ION 分配全部完成后启 watchdog: 防 regression/prefill/decode 挂死孤儿进程 */
+    /* CHAT=1 跳过 3-prompt 回归 (省 ~60s + ION/DDR 压力), 直接进 CHAT prefill/decode. */
+    if (!getenv("CHAT")) {
+        const int *PT[3] = {P1_TOKS, P2_TOKS, P3_TOKS};
+        int ok_all = 1;
+        double tot_all = now();
+        for (int p = 0; p < 3; p++) {
+            double tl, th; int nxt;
+            PoolSet *ps = (PSEQ[p] <= 3) ? &ps3 : (PSEQ[p] <= 5) ? &ps5 : &ps7;
+            run_prompt(rt, mem, pa, va, PT[p], PSEQ[p], p, esc, frms, bias_all,
+                       ps, lsz, &bad1, &bad2, &rbad, &tl, &th, &nxt, 0, 1);
+            int ok = (nxt == EXPECTED_NEXT[p]);
+            ok_all &= ok;
+            printf("  expected_next=%d  %s\n", EXPECTED_NEXT[p], ok ? "OK" : "MISMATCH");
+        }
+        printf("total wall = %.2fs (all 3 prompts)\n", now() - tot_all);
+        printf("==== P1/P2 bit-exact: bad1=%d bad2=%d  r_opt mismatches=%d  rsh(scan-vs-table)=%ld ====\n", bad1, bad2, rbad, g_rsh_bad);
+        printf("==== TIU runs: pass1=%ld pass2=%ld total=%ld ====\n", g_runs_pass1, g_runs_pass2, g_runs_pass1 + g_runs_pass2);
+        printf("==== 24L regression: expected_next 3/3 %s ====\n", ok_all ? "OK" : "FAIL");
+        printf("==== 24L regression: TIU internal %s ====\n", (bad1 + bad2 + rbad == 0) ? "BIT-EXACT" : "HAS MISMATCHES");
     }
-    printf("total wall = %.2fs (all 3 prompts)\n", now() - tot_all);
-    printf("==== P1/P2 bit-exact: bad1=%d bad2=%d  r_opt mismatches=%d  rsh(scan-vs-table)=%ld ====\n", bad1, bad2, rbad, g_rsh_bad);
-    printf("==== TIU runs: pass1=%ld pass2=%ld total=%ld ====\n", g_runs_pass1, g_runs_pass2, g_runs_pass1 + g_runs_pass2);
-    printf("==== 24L regression: expected_next 3/3 %s ====\n", ok_all ? "OK" : "FAIL");
-    printf("==== 24L regression: TIU internal %s ====\n", (bad1 + bad2 + rbad == 0) ? "BIT-EXACT" : "HAS MISMATCHES");
 
     /* ---- decode 实测 (chat 循环): DECODE=1 启用; DECODE_STEPS=N 控制步数 ---- */
-    if (getenv("DECODE")) {
+    if (getenv("DECODE") && !getenv("CHAT")) {
         int ndec = 5;
         const char *nd = getenv("DECODE_STEPS");
         if (nd) ndec = atoi(nd);
@@ -2013,7 +2333,7 @@ int main(void) {
         g_ra_err = 0; g_ra_res = 0; g_ra_tot = 0;
         double tl, th; int nxt;
         run_prompt(rt, mem, pa, va, P1_TOKS, 3, 0, esc, frms, bias_all,
-                   &ps3, lsz, &bad1, &bad2, &rbad, &tl, &th, &nxt);
+                   &ps3, lsz, &bad1, &bad2, &rbad, &tl, &th, &nxt, 0, 1);
         printf("  prefill done: kv_len=%d next=%d (expected 2130)\n", g_kv_len, nxt);
         /* B-2: decode 前释放 M=5/7 prefill pools (ION 回收 ~0.8MB, 提高 carveout 余量) */
         if (g_lw_mode == LW_ION_DB) {
@@ -2039,6 +2359,94 @@ int main(void) {
                    g_ra_err, g_ra_res, g_ra_tot,
                    g_ra_tot ? 100.0 * g_ra_res / g_ra_tot : 0.0);
         if (g_profile) profile_report("decode M=1");
+    }
+
+    /* ---- CHAT 问答模式 (CHAT=1): 读 /data/qwen/input_tokens.bin -> 泛化 prefill -> decode ----
+     * input_tokens.bin 格式: [n_tokens int32][token ids int32...] (与 qwen_tokenize.py 输出一致).
+     * 文件缺失/空 -> 报错退出. N<=7 复用 ps3/ps5/ps7; N>7 chunked prefill (每 chunk<=7, 绝对位置
+     * rope/KV, attention_ext 跨 chunk 因果). decode 生成 min(DECODE_STEPS, KV_CAP-N) 步.
+     * CHAT: 行 = prefill next + decode 步输出 (空格分隔 token id, host 解 token 用). */
+    if (getenv("CHAT")) {
+        /* 默认固定路径 /data/qwen/input_tokens.bin; CHAT_INPUT 可覆盖 (避免多 agent 并发覆盖冲突) */
+        static char ip_buf[160];
+        const char *ip = getenv("CHAT_INPUT");
+        if (!ip) ip = WDIR "/input_tokens.bin";
+        else { snprintf(ip_buf, sizeof ip_buf, "%s", ip); ip = ip_buf; }
+        FILE *tf = fopen(ip, "rb");
+        if (!tf) { fprintf(stderr, "CHAT: cannot open %s\n", ip); return 2; }
+        int32_t hdr = 0;
+        if (fread(&hdr, 4, 1, tf) != 1 || hdr <= 0) {
+            fprintf(stderr, "CHAT: %s missing/empty header (need [n_tokens int32][ids...])\n", ip);
+            fclose(tf); return 2;
+        }
+        if (hdr > MAX_SEQ) { fprintf(stderr, "CHAT: n_tokens=%d > MAX_SEQ=%d\n", hdr, MAX_SEQ); fclose(tf); return 2; }
+        if (hdr >= KV_CAP)  { fprintf(stderr, "CHAT: n_tokens=%d >= KV_CAP=%d (need >=1 decode slot)\n", hdr, KV_CAP); fclose(tf); return 2; }
+        int ntok = (int)hdr;
+        int toks[MAX_SEQ];
+        if (fread(toks, 4, ntok, tf) != (size_t)ntok) { fprintf(stderr, "CHAT: short token read\n"); fclose(tf); return 2; }
+        fclose(tf);
+
+        int ndec = 5;
+        const char *nd = getenv("DECODE_STEPS");
+        if (nd) ndec = atoi(nd);
+        if (ndec < 1) ndec = 1;
+        if (ndec > KV_CAP - ntok) ndec = KV_CAP - ntok;
+
+        printf("==== CHAT: n_tokens=%d + %d decode steps (KV_CAP=%d, 20->48 +0.67MB DDR anon) ====\n",
+               ntok, ndec, KV_CAP);
+        g_kv_len = 0;
+        g_ra_err = 0; g_ra_res = 0; g_ra_tot = 0;
+        double tl, th; int nxt;
+        int bad1c = 0, bad2c = 0, rbadc = 0;
+        double t_pre = now();
+        if (ntok <= 7) {
+            PoolSet *ps = (ntok <= 3) ? &ps3 : (ntok <= 5) ? &ps5 : &ps7;
+            run_prompt(rt, mem, pa, va, toks, ntok, 0, esc, frms, bias_all,
+                       ps, lsz, &bad1c, &bad2c, &rbadc, &tl, &th, &nxt, 0, 1);
+        } else {
+            int off = 0;
+            while (off < ntok) {
+                int cs = (ntok - off > 7) ? 7 : ntok - off;
+                int last = (off + cs == ntok);
+                PoolSet *ps = (cs <= 3) ? &ps3 : (cs <= 5) ? &ps5 : &ps7;
+                printf("  CHAT prefill chunk gpos=%d seq=%d%s\n", off, cs, last ? " (last)" : "");
+                run_prompt(rt, mem, pa, va, toks + off, cs, 0, esc, frms, bias_all,
+                           ps, lsz, &bad1c, &bad2c, &rbadc, &tl, &th, &nxt, off, last);
+                off += cs;
+            }
+        }
+        printf("  CHAT prefill done: kv_len=%d next=%d (%.2fs)\n", g_kv_len, nxt, now() - t_pre);
+
+        if (g_lw_mode == LW_ION_DB) {
+            pool_set_free(rt, &ps5); pool_set_free(rt, &ps7);
+            printf("  [ion_db] prefill pools ps5/ps7 freed (ION reclaimed)\n");
+        }
+        profile_reset();          /* prefill 之后重置: 只统计 decode 段 (M=1) */
+        int tok = nxt;            /* prefill next 作为首个生成 token / decode 输入 */
+        int gen[MAX_SEQ]; int ngen = 0;   /* 收集生成 token, 最后统一打 CHAT 行 (避免与 DECODE 诊断交错) */
+        gen[ngen++] = tok;
+        double sum = 0;
+        for (int i = 0; i < ndec; i++) {
+            double dt = run_decode_step(rt, mem, pa, va, tok, esc, frms, bias_all,
+                                        &ps1, g_use_merged ? &mp : NULL, lsz,
+                                        &bad1c, &bad2c, &rbadc, &nxt);
+            tok = nxt;
+            sum += dt;
+            gen[ngen++] = tok;
+        }
+        printf("CHAT:");
+        for (int i = 0; i < ngen; i++) printf(" %d", gen[i]);
+        printf("\n");
+        printf("==== CHAT decode avg per-token = %.2fs over %d steps (prefill n=%d) ====\n",
+               sum / ndec, ndec, ntok);
+        printf("==== CHAT TIU runs: pass1=%ld pass2=%ld total=%ld ====\n",
+               g_runs_pass1, g_runs_pass2, g_runs_pass1 + g_runs_pass2);
+        printf("==== CHAT bit-exact: bad1=%d bad2=%d r_opt=%d rsh=%ld ====\n", bad1c, bad2c, rbadc, g_rsh_bad);
+        if (g_lw_mode == LW_MMAP_RA || g_lw_mode == LW_MMAP_DB)
+            printf("==== readahead errors: %d | mincore resident snapshot: %ld/%ld (%.1f%%) ====\n",
+                   g_ra_err, g_ra_res, g_ra_tot,
+                   g_ra_tot ? 100.0 * g_ra_res / g_ra_tot : 0.0);
+        if (g_profile) profile_report("CHAT M=1");
     }
 
     if (g_lw_mode == LW_MMAP_TH) {
