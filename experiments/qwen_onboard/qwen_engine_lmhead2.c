@@ -223,9 +223,11 @@ static void *wd_thread_main(void *arg) {
         usleep(500000);   /* 0.5s 检查粒度 */
         long long hb = __atomic_load_n(&g_wd_heartbeat_ns, __ATOMIC_RELAXED);
         if (g_wd_enabled && (wd_now_ns() - hb) > WD_TIMEOUT_NS) {
-            fprintf(stderr, "[WATCHDOG] %.0fs 无心跳 (>%.0fs), 判定挂死; 强制 _exit(1) "
-                            "让内核释放 ION (防孤儿进程 24MB 泄漏).\n",
-                    (double)(wd_now_ns() - hb) / 1e9, WD_TIMEOUT_NS / 1e9);
+            /* 用 write() 而非 fprintf: async-signal-safe, 不抢 stdio 锁 —
+             * 若主线程正卡在 SDK 内持锁, fprintf 会死锁, 反而违背看门狗初衷. */
+            static const char msg[] = "[WATCHDOG] heartbeat timeout, force _exit(1) to release ION "
+                                      "(prevent orphan 24MB leak)\n";
+            write(2, msg, sizeof msg - 1);
             _exit(1);
         }
     }
@@ -916,9 +918,11 @@ static int gsc_ion_load(CVI_RT_HANDLE rt) {
     g_gsc_ion = (uint16_t *)base;
     g_gsc_ion_n = ion_layers;
 
-    /* Tier 2: 剩余层 DDR mmap + 预读入 page cache (与 B-2 同机制, decode 期 0 页错误). */
+    /* Tier 2: 剩余层 DDR mmap + 预读入 page cache (与 B-2 同机制, decode 期 0 页错误).
+     * 仅当 Tier 2 (ion_layers=GSC_ION_LAYERS<L) 才需要 DDR 层; Tier 1 (ion_layers=L,
+     * 24 层全 ION) 必须跳过, 否则会去 mmap 不存在的 layer24/25 触发误回退. */
     size_t ddlen[GSC_DDR_LAYERS] = {0};   /* 每个 DDR 层 mmap 长度 (失败回收用; 均等于层文件大小) */
-    for (int i = 0; i < GSC_DDR_LAYERS; i++) {
+    for (int i = 0; ion_layers < L && i < GSC_DDR_LAYERS; i++) {
         int l = ion_layers + i;
         char path[160]; snprintf(path, sizeof path, "%s/layer%d_kal.bin", WDIR, l);
         int fd = open(path, O_RDONLY);
