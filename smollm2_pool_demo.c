@@ -60,12 +60,16 @@ static int      g_lm_brk_on = 0;
  * reopen-ion retry loop / TPU submit timeout / SD read stall — for
  * SM_WD_TIMEOUT (default 30) seconds, it _exit()s so the kernel closes the
  * ion/dma-buf fds and releases ION.  A dead process never leaks ION. */
-static volatile double g_wd_hb = 0;
-static double wd_now(void) {
+/* C906 rv64 下 64-bit double 访存非原子 (可能撕裂); 心跳改 long long + __atomic
+ * 保证 8-byte 原子 (ld.d/st.d/AMO). 与 qwen 引擎看门狗实现对齐. */
+static volatile long long g_wd_hb_ns = 0;
+static long long wd_now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec / 1e9;
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
-static void wd_kick(void) { g_wd_hb = wd_now(); }
+static void wd_kick(void) {
+    __atomic_store_n(&g_wd_hb_ns, wd_now_ns(), __ATOMIC_RELAXED);
+}
 
 static void *wd_thread(void *arg) {
     (void)arg;
@@ -74,10 +78,13 @@ static void *wd_thread(void *arg) {
       if (e && atoi(e) > 0) to = atoi(e); }
     wd_kick();
     for (;;) {
-        double last = g_wd_hb;
         sleep(to);
-        if (g_wd_hb - last < 1e-6) {       /* no heartbeat for `to` s => hung */
-            fprintf(stderr, "[wd] NO HEARTBEAT >%ds — force _exit to release ION\n", to);
+        long long hb = __atomic_load_n(&g_wd_hb_ns, __ATOMIC_RELAXED);
+        if (wd_now_ns() - hb > (long long)to * 1000000000LL) {  /* no heartbeat for `to` s => hung */
+            char msg[128];
+            int n = snprintf(msg, sizeof msg,
+                             "[wd] NO HEARTBEAT >%ds - force _exit to release ION\n", to);
+            write(2, msg, n > 0 && n < (int)sizeof msg ? n : sizeof msg - 1);
             _exit(1);                      /* close fds -> kernel frees ION */
         }
     }
