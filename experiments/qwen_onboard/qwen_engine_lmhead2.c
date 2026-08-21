@@ -1621,8 +1621,17 @@ static float cosb[(MAX_SEQ + 8) * (HD / 2)], sinb[(MAX_SEQ + 8) * (HD / 2)];
 static int g_embcl_fd = -1;    /* embed_i8_cl.bin fd (pread spans, 非 mmap) */
 static float *g_esccl;     /* [V] fp32 cluster-major scales */
 static int32_t *g_tokcl;   /* [V] int32 reordered row -> token */
-static float *g_cent;      /* [C*D] fp32 centroids (load 时由 fp16 预转) */
+static float *g_cent;      /* [C*D] fp32 centroids (DDR+mlock 回退路径) */
 static int32_t *g_clidx;   /* [C*2] int32 (offset, count) */
+/* ---- Phase 6 落地: centroid fp16 常驻 ION FREE (自适应放置) ----
+ * g_cent_f16: load 时读入的 fp16 原始数据 (随后由 lmhead2_cent_place 放置).
+ * g_cent_ion / g_cent_va: ION 路径 (fp16 1.84MB, 免 mlock, ION 常驻).
+ * g_cent: DDR 回退路径 (fp32 3.67MB + mlock). g_cent_in_ion 区分两路径. */
+static uint16_t *g_cent_f16 = NULL;   /* [C*D] fp16 原始数据 (临时, 放置后释放) */
+static CVI_RT_MEM g_cent_ion = NULL;  /* ION centroid buffer (fp16, 1.84MB) */
+static uint8_t *g_cent_va = NULL;     /* VA into ION (fp16 bytes) */
+static int g_cent_in_ion = 0;         /* 1 = fp16 in ION; 0 = fp32 DDR+mlock */
+#define CENT_ION_SZ ((size_t)LMHEAD_C * D * 2)   /* 1024*896*2 = 1,835,008 B */
 
 static inline float f16_to_f32(uint16_t h) {
     uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
@@ -1637,19 +1646,18 @@ static inline float f16_to_f32(uint16_t h) {
 }
 
 static int lmhead2_load(void) {
-    g_cent = malloc((size_t)LMHEAD_C * D * sizeof(float));
     g_clidx = malloc((size_t)LMHEAD_C * 2 * sizeof(int32_t));
     g_esccl = malloc((size_t)V * sizeof(float));
     g_tokcl = malloc((size_t)V * sizeof(int32_t));
-    if (!g_cent || !g_clidx || !g_esccl || !g_tokcl) return 1;
+    if (!g_clidx || !g_esccl || !g_tokcl) return 1;
     FILE *f;
-    /* centroid_f16.bin: 载入后一次性转 fp32 (避免每 token 917K 次 f16 转换) */
-    uint16_t *ch = malloc((size_t)LMHEAD_C * D * sizeof(uint16_t));
-    if (!ch) return 1;
+    /* centroid_f16.bin: 读入 fp16 原始数据到临时缓冲. 放置决策 (ION fp16 常驻 vs
+     * DDR fp32+mlock) 在 lmhead2_cent_place() — 需要 CVI_RT_Init 之后的 ION 余量. */
+    g_cent_f16 = malloc(CENT_ION_SZ);
+    if (!g_cent_f16) return 1;
     if (!(f = fopen(CENT_PATH, "rb"))) return 1;
-    if (fread(ch, 2, (size_t)LMHEAD_C * D, f) != (size_t)LMHEAD_C * D) return 1; fclose(f);
-    for (size_t i = 0; i < (size_t)LMHEAD_C * D; i++) g_cent[i] = f16_to_f32(ch[i]);
-    free(ch);
+    if (fread(g_cent_f16, 2, (size_t)LMHEAD_C * D, f) != (size_t)LMHEAD_C * D) { fclose(f); return 1; }
+    fclose(f);
     if (!(f = fopen(CLIDX_PATH, "rb"))) return 1;
     if (fread(g_clidx, 4, (size_t)LMHEAD_C * 2, f) != (size_t)LMHEAD_C * 2) return 1; fclose(f);
     if (!(f = fopen(ESC_CL_PATH, "rb"))) return 1;
@@ -1659,17 +1667,55 @@ static int lmhead2_load(void) {
     /* embed_i8_cl.bin: 保持 fd, Stage2 用 pread 读整 span (避免 mmap 每页 fault) */
     g_embcl_fd = open(EMBED_CL_PATH, O_RDONLY);
     if (g_embcl_fd < 0) return 1;
-    /* 关键: 仅 mlock g_cent (stage1 每次 token 全量读 3.67MB).
-     * Linux 侧仅 ~28MB (ION 占 ~36MB), 24 层运行产生内存压力会把匿名页换出,
-     * g_cent 被 swap -> stage1 每次 swap-in ~500ms. mlock 常驻后 ~9ms.
-     * 注意: 不要 mlock 过多 (会把 swap 压力转移到 bias/frms/esc, 拖慢 24 层),
-     * 实测全量 mlock 4.67MB 使 prefill +103s; 只 mlock g_cent 3.67MB 最优. */
-    size_t lk = 0;
-    /* NOMLOCK=1 时跳过, 用于对照: 区分 mlock 内存压力 vs SD/热漂移 */
-    if (!getenv("NOMLOCK"))
-        if (mlock(g_cent, (size_t)LMHEAD_C * D * sizeof(float)) == 0) lk += (size_t)LMHEAD_C * D * sizeof(float);
-    printf("  [lmhead2_load] mlock'd %.2f MB (g_cent only%s)\n", lk / 1048576.0,
-           getenv("NOMLOCK") ? ", DISABLED" : "");
+    return 0;
+}
+
+/* Phase 6 落地: centroid 放置 — 优先 ION fp16 常驻 (CEO 立项范围项 3).
+ * 决策基于 ION carveout 实时余量: 需保证放置后 pools 预检 (ION_POOLS_EST + mp) 仍可过.
+ * 不足则回退 DDR fp32 + mlock (Phase 6 既有行为).
+ * 调用点: CVI_RT_Init + gsc 缓存分配之后, pool_build 之前.
+ * 注意: 仅 mlock g_cent (stage1 每次 token 全量读 3.67MB). Linux 侧仅 ~28MB, 24 层
+ * 运行内存压力会把匿名页换出 -> stage1 swap-in ~500ms; mlock 常驻后 ~9ms. 不要 mlock
+ * 过多 (会把 swap 压力转移到 bias/frms/esc); 只 mlock g_cent 3.67MB 最优. */
+static int lmhead2_cent_place(CVI_RT_HANDLE rt) {
+    long long free_ion = ion_carveout_free();
+    long long need = (long long)CENT_ION_SZ
+                   + (long long)ION_POOLS_EST
+                   + (g_use_merged ? (long long)ION_MP_EST : 0);
+    int use_ion = 0;
+    const char *ci = getenv("CENT_ION");
+    if (ci && !strcmp(ci, "0")) {
+        printf("  [centroid] CENT_ION=0: force DDR fp32+mlock fallback\n");
+    } else if (free_ion >= 0 && free_ion >= need) {
+        use_ion = 1;
+    } else {
+        printf("  [centroid] ION free=%lld B < need %lld B -> DDR fp32+mlock fallback\n",
+               free_ion, need);
+    }
+    if (use_ion) {
+        g_cent_ion = rt_alloc_safe(rt, CENT_ION_SZ, "centroid");
+        if (g_cent_ion) {
+            g_cent_va = CVI_RT_MemGetVAddr(g_cent_ion);
+            memcpy(g_cent_va, g_cent_f16, CENT_ION_SZ);
+            g_cent_in_ion = 1;
+            printf("  [centroid] ION fp16 resident: %.2f MB (free_ion=%lld B); stage1 f16->f32 on-the-fly\n",
+                   CENT_ION_SZ / 1048576.0, free_ion);
+        } else {
+            printf("  [centroid] ION alloc FAILED -> DDR fp32+mlock fallback\n");
+        }
+    }
+    if (!g_cent_in_ion) {
+        g_cent = malloc((size_t)LMHEAD_C * D * sizeof(float));
+        if (!g_cent) return 1;
+        for (size_t i = 0; i < (size_t)LMHEAD_C * D; i++) g_cent[i] = f16_to_f32(g_cent_f16[i]);
+        size_t lk = 0;
+        if (!getenv("NOMLOCK"))
+            if (mlock(g_cent, (size_t)LMHEAD_C * D * sizeof(float)) == 0)
+                lk += (size_t)LMHEAD_C * D * sizeof(float);
+        printf("  [centroid] DDR fp32+mlock: %.2f MB resident (stage1 pre-converted%s)\n",
+               lk / 1048576.0, getenv("NOMLOCK") ? ", NOMLOCK" : "");
+    }
+    free(g_cent_f16); g_cent_f16 = NULL;
     return 0;
 }
 
@@ -1687,11 +1733,24 @@ static double g_t_dot = 0, g_t_sel = 0;   /* stage1 dot/selection 分解 (调试
 static void lmhead_stage1(const float *h, int Kc, int *sel) {
     float sc[LMHEAD_C];
     double t0 = now();
-    for (int c = 0; c < LMHEAD_C; c++) {
-        const float *cd = g_cent + (size_t)c * D;
-        float s = 0;
-        for (int j = 0; j < D; j++) s += h[j] * cd[j];
-        sc[c] = s;
+    if (g_cent_in_ion) {
+        /* ION 路径: centroid fp16 [C,D], 逐元素 f16->f32 后 dot (f16_to_f32 确定性,
+         * 与 fp32 预转逐位一致 — 同一转换函数, 累加顺序不变). */
+        const uint16_t *cd16 = (const uint16_t *)g_cent_va;
+        for (int c = 0; c < LMHEAD_C; c++) {
+            const uint16_t *row = cd16 + (size_t)c * D;
+            float s = 0;
+            for (int j = 0; j < D; j++) s += h[j] * f16_to_f32(row[j]);
+            sc[c] = s;
+        }
+    } else {
+        /* DDR 回退路径: fp32 预转 (mlock 常驻). */
+        for (int c = 0; c < LMHEAD_C; c++) {
+            const float *cd = g_cent + (size_t)c * D;
+            float s = 0;
+            for (int j = 0; j < D; j++) s += h[j] * cd[j];
+            sc[c] = s;
+        }
     }
     g_t_dot = now() - t0;
     t0 = now();
@@ -2073,6 +2132,7 @@ static void ion_cleanup_exit(CVI_RT_HANDLE rt, CVI_RT_MEM mem) {
     for (int s = 0; s < SD_NSLOT; s++) {
         if (g_sd_ion[s]) { CVI_RT_MemFree(rt, g_sd_ion[s]); g_sd_ion[s] = NULL; }
     }
+    if (g_cent_ion) { CVI_RT_MemFree(rt, g_cent_ion); g_cent_ion = NULL; }
     if (mem) CVI_RT_MemFree(rt, mem);
     CVI_RT_DeInit(rt);
 }
@@ -2107,9 +2167,9 @@ int main(void) {
 
     /* ---- Phase 6 two-stage LM head weights (centroid/clidx/esc_cl/tok_cl + mmap embed_cl) ---- */
     if (lmhead2_load()) { fprintf(stderr, "lmhead2_load failed (cluster files missing?)\n"); return 2; }
-    printf("lmhead2 loaded (C=%d Kc=%d; centroid+idx ~%.2fMB resident, embed_cl mmap'd)\n",
+    printf("lmhead2 loaded (C=%d Kc=%d; centroid fp16+idx ~%.2fMB, placement after CVI_RT_Init; embed_cl mmap'd)\n",
            LMHEAD_C, LMHEAD_KC, ((size_t)LMHEAD_C * D * 2 + (size_t)LMHEAD_C * 8) / 1048576.0);
-    printf("BUILD: stage1=float32-per-token-dot centroid=preconverted\n");
+    printf("BUILD: stage1 = h·centroid [CPU dot, ION-fp16 resident preferred]\n");
 
     /* ---- rope tables ---- */
     for (int pos = 0; pos < MAX_SEQ + 8; pos++)
@@ -2183,6 +2243,13 @@ int main(void) {
     } else {
         double tg = now();
         if (gsc_ion_load(rt) == 0) printf("GSC_ION load done in %.3fs\n", now() - tg);
+    }
+
+    /* Phase 6 落地: centroid 放置 (ION fp16 常驻优先; 余量不足回退 DDR fp32+mlock).
+     * 须在 gsc 之后 (free_ion 反映 gsc 占用) 且 pool_build 之前 (保证 pools 预检可过). */
+    if (lmhead2_cent_place(rt) != 0) {
+        fprintf(stderr, "centroid place FAILED (OOM)\n");
+        ion_cleanup_exit(rt, mem); return 2;
     }
 
     /* pool/mp 分配前预检: 非 gsc 部分需 ~1.9MB (实测 pools 1.70MB + mp 0.26MB).
@@ -2473,6 +2540,7 @@ int main(void) {
     }
     free(esc);
     if (g_gsc_ion_mem) CVI_RT_MemFree(rt, g_gsc_ion_mem);
+    if (g_cent_ion) CVI_RT_MemFree(rt, g_cent_ion);
     for (int i = 0; i < GSC_DDR_LAYERS; i++)
         if (g_gsc_ddr_map[i]) munmap(g_gsc_ddr_map[i], lsz);
     free(g_rms_all);
