@@ -570,8 +570,8 @@ static void eng_matmul(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uint8_t *v
 
         /* ---- pass1 phase: all tiles, rshift=rsafe ---- */
         for (int t = 0; t < ntiles; t++) {
-            const uint8_t *nibt = nib + (size_t)g * N * 16 + (size_t)toff[t] * 16;
-            ta = now(); dequant_kal_rvv(nibt, tn[t], (int8_t *)(va + DQ_OFF)); g_t_dequant += now() - ta;
+            const uint8_t *nibg = nib + (size_t)g * 16 * N;   /* nib16 K-block base */
+            ta = now(); dequant_kal_rvv(nibg, N, toff[t], tn[t], (int8_t *)(va + DQ_OFF)); g_t_dequant += now() - ta;
             ta = now();
             for (int m = 0; m < M; m++)
                 memcpy(va + ACTQ_OFF + (size_t)m * 32, x_i8 + (size_t)m * K + (size_t)g * 32, 32);
@@ -620,8 +620,8 @@ static void eng_matmul(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uint8_t *v
 
         /* ---- pass2 phase: all tiles, rshift=r_opt ---- */
         for (int t = 0; t < ntiles; t++) {
-            const uint8_t *nibt = nib + (size_t)g * N * 16 + (size_t)toff[t] * 16;
-            ta = now(); dequant_kal_rvv(nibt, tn[t], (int8_t *)(va + DQ_OFF)); g_t_dequant += now() - ta;
+            const uint8_t *nibg = nib + (size_t)g * 16 * N;   /* nib16 K-block base */
+            ta = now(); dequant_kal_rvv(nibg, N, toff[t], tn[t], (int8_t *)(va + DQ_OFF)); g_t_dequant += now() - ta;
             ta = now();
             for (int m = 0; m < M; m++)
                 memcpy(va + ACTQ_OFF + (size_t)m * 32, x_i8 + (size_t)m * K + (size_t)g * 32, 32);
@@ -718,7 +718,7 @@ static void eng_matmul_merged(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uin
     memset(accd, 0, sizeof(double) * (size_t)M * N);
 
     for (int g = 0; g < KG; g++) {
-        const uint8_t *nibg = nib + (size_t)g * N * 16;
+        const uint8_t *nibg = nib + (size_t)g * 16 * N;   /* nib16 K-block base */
         int block_max = 0, gold_max = 0;
 
         /* ---- dequant full [32,N] into TILE-MAJOR layout (tile t at
@@ -727,7 +727,7 @@ static void eng_matmul_merged(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uin
          * dequant would NOT match the per-tile g2lR stride.) ---- */
         ta = now();
         for (int t = 0; t < mp->nt; t++)
-            dequant_kal_rvv(nibg + (size_t)t * mp->tilew * 16, mp->tilew,
+            dequant_kal_rvv(nibg, N, (size_t)t * mp->tilew, mp->tilew,
                             (int8_t *)(va + DQ_OFF) + (size_t)t * 32 * mp->tilew);
         g_t_dequant += now() - ta;
         ta = now(); memcpy(va + ACTQ_OFF, x_i8 + (size_t)g * 32, 32); g_t_copyact += now() - ta;
