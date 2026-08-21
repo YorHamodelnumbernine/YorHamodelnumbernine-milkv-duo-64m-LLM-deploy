@@ -204,7 +204,6 @@ static CVI_RT_MEM rt_alloc_safe(CVI_RT_HANDLE rt, size_t sz, const char *what) {
 }
 
 /* ---- watchdog (防孤儿进程 ION 泄漏) ---- */
-#define WD_TIMEOUT_NS (90LL * 1000000000LL)
 static volatile long long g_wd_heartbeat_ns = 0;
 static volatile sig_atomic_t g_wd_enabled = 0;
 static volatile sig_atomic_t g_wd_die = 0;
@@ -217,12 +216,19 @@ static long long wd_now_ns(void) {
 static void wd_kick(void) {
     if (g_wd_enabled) __atomic_store_n(&g_wd_heartbeat_ns, wd_now_ns(), __ATOMIC_RELAXED);
 }
+/* 超时: WD_TIMEOUT_SEC env 可调, 默认 90s (decode ~11-13s/token 每层打点 + init 最长间隔 ~10s 均有余量).
+ * 调低 (如 30s) 可更快回收卡死进程; 调高供慢 SD 环境. */
+static long long wd_timeout_ns(void) {
+    const char *e = getenv("WD_TIMEOUT_SEC");
+    if (e && atoi(e) >= 10) return (long long)atoi(e) * 1000000000LL;
+    return 90LL * 1000000000LL;
+}
 static void *wd_thread_main(void *arg) {
     (void)arg;
     while (!g_wd_die) {
         usleep(500000);   /* 0.5s 检查粒度 */
         long long hb = __atomic_load_n(&g_wd_heartbeat_ns, __ATOMIC_RELAXED);
-        if (g_wd_enabled && (wd_now_ns() - hb) > WD_TIMEOUT_NS) {
+        if (g_wd_enabled && (wd_now_ns() - hb) > wd_timeout_ns()) {
             /* 用 write() 而非 fprintf: async-signal-safe, 不抢 stdio 锁 —
              * 若主线程正卡在 SDK 内持锁, fprintf 会死锁, 反而违背看门狗初衷. */
             static const char msg[] = "[WATCHDOG] heartbeat timeout, force _exit(1) to release ION "
@@ -2168,6 +2174,15 @@ int main(void) {
     setvbuf(stderr, NULL, _IONBF, 0);
     printf("===== M2 24-layer prefill + LM head (TIU Path A', 3-prompt regression) =====\n");
     ion_abort_install();   /* 捕获 CVI_RT_MemAlloc 的 SIGABRT -> rt_alloc_safe 回退, 不杀进程 */
+    wd_start();   /* watchdog 覆盖整个初始化窗口: CVI_RT_Init/MemAlloc/gsc SD 读挂死也强制退出防孤儿 ION */
+
+    /* TEST-ONLY: QH_INIT_HANG=1 spins main() 在 init 窗口 (wd_start 后、CVI_RT_Init 前,
+     * 旧代码看门狗未覆盖段) 以验证 init 窗口看门狗覆盖; 正常运行绝不进入. */
+    { const char *ht = getenv("QH_INIT_HANG");
+      if (ht && atoi(ht) > 0) {
+          fprintf(stderr, "[WATCHDOG] QH_INIT_HANG set - spinning main in init window; watchdog should _exit\n");
+          for (;;) { }
+      } }
 
     /* ---- small weights: embed_scales, final_rms, all biases ---- */
     float *esc = malloc(V * sizeof(float));
@@ -2193,6 +2208,7 @@ int main(void) {
 
     /* ---- Phase 6 two-stage LM head weights (centroid/clidx/esc_cl/tok_cl + mmap embed_cl) ---- */
     if (lmhead2_load()) { fprintf(stderr, "lmhead2_load failed (cluster files missing?)\n"); return 2; }
+    wd_kick();   /* init 里程碑: lmhead2_load (cluster 文件读) */
     printf("lmhead2 loaded (C=%d Kc=%d; centroid fp16+idx ~%.2fMB, placement after CVI_RT_Init; embed_cl mmap'd)\n",
            LMHEAD_C, LMHEAD_KC, ((size_t)LMHEAD_C * D * 2 + (size_t)LMHEAD_C * 8) / 1048576.0);
     printf("BUILD: stage1 = h·centroid [CPU dot, ION-fp16 resident preferred]\n");
@@ -2207,6 +2223,7 @@ int main(void) {
 
     /* ---- ION + prebuilt pools (per M, exact tile widths) ---- */
     CVI_RT_HANDLE rt; CVI_RT_Init(&rt);
+    wd_kick();   /* init 里程碑: CVI_RT_Init */
     ion_carveout_report("start");   /* 启动基线: used/free/peak 诊断 (OOM 排障) */
     CVI_RT_MEM mem = rt_alloc_safe(rt, NEURON_SZ, "neuron");
     if (!mem) {
@@ -2218,6 +2235,7 @@ int main(void) {
     uint8_t *va = CVI_RT_MemGetVAddr(mem);
     CVI_RT_SetBaseReg(rt, 0, pa);
     memset(va, 0, NEURON_SZ);
+    wd_kick();   /* init 里程碑: neuron rt_alloc_safe */
 
     /* ---- Phase 7e: gsc cache (GSC_ION=0 关闭; 先于 pool cmdbuf 分配大块以最大化
      * ION 连续空间). B-2 (LW_READ=ion_db): gsc 22 层 ION + 2 层 DDR (nib-only SD_BUF
@@ -2270,6 +2288,7 @@ int main(void) {
         double tg = now();
         if (gsc_ion_load(rt) == 0) printf("GSC_ION load done in %.3fs\n", now() - tg);
     }
+    wd_kick();   /* init 里程碑: gsc 权重 SD 读 (最长段 ~10s) */
 
     /* Phase 6 落地: centroid 放置 (ION fp16 常驻优先; 余量不足回退 DDR fp32+mlock).
      * 须在 gsc 之后 (free_ion 反映 gsc 占用) 且 pool_build 之前 (保证 pools 预检可过). */
@@ -2277,6 +2296,7 @@ int main(void) {
         fprintf(stderr, "centroid place FAILED (OOM)\n");
         ion_cleanup_exit(rt, mem); return 2;
     }
+    wd_kick();   /* init 里程碑: lmhead2_cent_place (centroid 放置) */
 
     /* pool/mp 分配前预检: 非 gsc 部分需 ~1.9MB (实测 pools 1.70MB + mp 0.26MB).
      * 空间不足先关 merged pool (省 ~0.26MB), 再不足则干净报错退出 (不触发 SDK assert/泄漏). */
@@ -2314,6 +2334,7 @@ int main(void) {
         return 2;
     }
     printf("pools built (M=1:{128,384,896} M=3:{128,384,896} M=5/7:{128,256,768}) in %.3fs\n", now() - t0);
+    wd_kick();   /* init 里程碑: pool_build ×12 */
     MergedPool mp; memset(&mp, 0, sizeof mp);
     if (g_use_merged) {
         double tm = now();
@@ -2337,6 +2358,7 @@ int main(void) {
     memset(g_kvv_s, 0, (size_t)L * KV_CAP * sizeof(float));
     printf("KV cache (INT8 per-token) = %zu B/layer x2 + scale %zu B/layer x2 (L=%d KV_CAP=%d DKV=%d)\n",
            (size_t)KV_CAP * DKV, (size_t)KV_CAP * 4, L, KV_CAP, DKV);
+    wd_kick();   /* init 里程碑: KV cache malloc+memset */
 
     /* ---- Phase 7/7b: 层权重读路径模式 (LW_READ=mmap|mmap_ra|pread|mmap_db) ---- */
     const char *lw = getenv("LW_READ");
@@ -2400,7 +2422,6 @@ int main(void) {
     }
 
     int bad1 = 0, bad2 = 0, rbad = 0;
-    wd_start();   /* ION 分配全部完成后启 watchdog: 防 regression/prefill/decode 挂死孤儿进程 */
     /* CHAT=1 跳过 3-prompt 回归 (省 ~60s + ION/DDR 压力), 直接进 CHAT prefill/decode. */
     if (!getenv("CHAT")) {
         const int *PT[3] = {P1_TOKS, P2_TOKS, P3_TOKS};
