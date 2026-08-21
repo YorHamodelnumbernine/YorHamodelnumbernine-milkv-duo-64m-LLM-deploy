@@ -46,6 +46,13 @@ typedef struct {
 static lm_brk_t g_lm_brk;
 static int      g_lm_brk_on = 0;
 
+/* LM_BRK=1 enables the per-phase LM_Head timing breakdown; default OFF so the
+ * production path has zero TICK() (clock_gettime) overhead.  LM_BRK_TICK()
+ * returns 0 when disabled, and LM_BRK_ADD() only records when enabled. */
+#define LM_BRK_TICK()   (g_lm_brk_on ? TICK() : 0)
+#define LM_BRK_ADD(field, t0) \
+    do { if (g_lm_brk_on) g_lm_brk.field += (uint64_t)(TICK() - (t0)); } while (0)
+
 /* ---- ION orphan watchdog (DESIGN_ION_CLEANUP.md) ----
  * A hung-but-alive process is what leaks the 24MB ION carveout pool and
  * poisons later runs (ion ioctl fail:: Out of memory).  The watchdog thread
@@ -1788,7 +1795,8 @@ fallback:
     if (need_lm_head) {
     ts = TICK();
     memset(&g_lm_brk, 0, sizeof(g_lm_brk));
-    g_lm_brk_on = 1;   /* Task 1 step 1.1: enable per-phase breakdown */
+    const char *lm_brk = getenv("LM_BRK");   /* LM_BRK=1 enables timing; default off */
+    g_lm_brk_on = (lm_brk && atoi(lm_brk)) ? 1 : 0;
     float *final_normed = (float *)malloc(n_tokens * D * sizeof(float));
     float *final_rms = (float *)malloc(D * sizeof(float));
     char path[256];
@@ -1941,7 +1949,7 @@ fallback:
 
     for (int v_start = 0; v_start < V; v_start += CHUNK) {
         wd_kick();   /* watchdog: LM_Head chunk */
-        double _loop0 = TICK();
+        double _loop0 = LM_BRK_TICK();
         int cur_v = (v_start + CHUNK <= V) ? CHUNK : V - v_start;
         int nxt = 1 - cur;
         int nxt_v_start = v_start + CHUNK;
@@ -1953,15 +1961,15 @@ fallback:
         if (has_nxt) {
             int nxt_cur_v = (nxt_v_start + CHUNK <= V) ? CHUNK : V - nxt_v_start;
             if (lm_job_pending) {
-                double _a0 = TICK();
+                double _a0 = LM_BRK_TICK();
                 ef_wait(&lm_job);
                 lm_job_pending = 0;
                 CVI_RT_MemFlush(ctx->rt_handle, pool->ion_mem);
-                g_lm_brk.t_sd_wait += (uint64_t)(TICK() - _a0);
+                LM_BRK_ADD(t_sd_wait, _a0);
             }
             if (lm_use_mbox) {
                 int mbox_slot = 0;
-                double _a1 = TICK();
+                double _a1 = LM_BRK_TICK();
                 if (mbox_embed_xpose_async(ctx, mbox_slot,
                                            xpose_src_pa[nxt], xpose_dst_pa[nxt],
                                            D, nxt_cur_v) == 0) {
@@ -1969,43 +1977,43 @@ fallback:
                 } else {
                     lm_use_mbox = 0;   /* fall through to CPU transpose */
                 }
-                g_lm_brk.t_xpose_kick += (uint64_t)(TICK() - _a1);
+                LM_BRK_ADD(t_xpose_kick, _a1);
             }
             if (!lm_use_mbox) {
-                double _a2 = TICK();
+                double _a2 = LM_BRK_TICK();
                 LM_CPU_TRANSPOSE(xpose_dst[nxt], xpose_src[nxt], nxt_cur_v);
                 lm_xpose_pending = 0;
-                g_lm_brk.t_xpose_poll += (uint64_t)(TICK() - _a2);
+                LM_BRK_ADD(t_xpose_poll, _a2);
             }
         }
 
         /* (b) Kick off SD read of chunk i+2 into xpose_src[cur], freed by
          * TRANSPOSE(i) which was confirmed done in the previous iteration. */
-        double _b0 = TICK();
+        double _b0 = LM_BRK_TICK();
         if (nxt_v_start + CHUNK < V) {
             int v2 = nxt_v_start + CHUNK;   /* chunk i+2 */
             int c2 = (v2 + CHUNK <= V) ? CHUNK : V - v2;
             LM_LOAD_CHUNK(xpose_src[cur], v2, c2);
         }
-        g_lm_brk.t_load += (uint64_t)(TICK() - _b0);
+        LM_BRK_ADD(t_load, _b0);
 
         /* (c) matmul + dequant of current chunk using xpose_dst[cur], which
          * was fully transposed before this iteration began. */
-        double _c0 = TICK();
+        double _c0 = LM_BRK_TICK();
         rc_lm = tpu_matmul_build(ctx, cvk, x_final_i8, n_tokens, D,
                                   xpose_dst[cur], cur_v,
                                   lm_result_off, SM_SCRATCH_OFF, rshift_lm);
-        g_lm_brk.t_matmul += (uint64_t)(TICK() - _c0);
+        LM_BRK_ADD(t_matmul, _c0);
         if (!rc_lm) {
-            double _c1 = TICK();
+            double _c1 = LM_BRK_TICK();
             CVI_RT_Submit(ctx->rt_khandle);
             CVI_RT_MemInvld(ctx->rt_handle, ctx->neuron_mem);
-            g_lm_brk.t_submit += (uint64_t)(TICK() - _c1);
+            LM_BRK_ADD(t_submit, _c1);
         }
         if (rc_lm) { free(x_final_i8); free(x); free(logits_out); return -1; }
 
         int8_t *logits_i8 = (int8_t *)(nm + lm_result_off);
-        double _d0 = TICK();
+        double _d0 = LM_BRK_TICK();
         for (int t = 0; t < n_tokens; t++) {
             float *lt_out = logits_out + t * V + v_start;
             int8_t *lt_i8  = logits_i8 + t * cur_v;
@@ -2018,7 +2026,7 @@ fallback:
                            EMBED_SCALE, sc_final, rshift_lm);
             }
         }
-        g_lm_brk.t_dequant += (uint64_t)(TICK() - _d0);
+        LM_BRK_ADD(t_dequant, _d0);
 
         /* (d) Poll the async transpose of chunk i+1 (ran during the matmul+
          * dequant above).  Fall back to CPU transpose on mbox failure. */
@@ -2027,23 +2035,25 @@ fallback:
             uint8_t *nm_ptr = ctx->neuron_vaddr;
             uint64_t nm_pa = CVI_RT_MemGetPAddr(ctx->neuron_mem);
             mha_dma_desc_t *desc = mbox_desc_ptr(nm_ptr, nm_pa, 0);
-            double _d1 = TICK();
+            double _d1 = LM_BRK_TICK();
             if (mbox_poll_desc(ctx, desc, MBOX_TIMEOUT_US) != 0) {
                 lm_use_mbox = 0;
-                double _d2 = TICK();
+                double _d2 = LM_BRK_TICK();
                 LM_CPU_TRANSPOSE(xpose_dst[nxt], xpose_src[nxt], nxt_cur_v);
-                g_lm_brk.t_xpose_poll += (uint64_t)(TICK() - _d2);
+                LM_BRK_ADD(t_xpose_poll, _d2);
             }
-            g_lm_brk.t_xpose_poll += (uint64_t)(TICK() - _d1);
+            LM_BRK_ADD(t_xpose_poll, _d1);
             lm_xpose_pending = 0;
         }
         cur = nxt;
-        g_lm_brk.n_chunks++;
-        g_lm_brk.t_total += (uint64_t)(TICK() - _loop0);
+        if (g_lm_brk_on) {
+            g_lm_brk.n_chunks++;
+            g_lm_brk.t_total += (uint64_t)(TICK() - _loop0);
+        }
     }
     fprintf(stderr, "  [LM_Head] %d/%d chunks from SD\n",
             lm_sd_chunks, n_lm_chunks);
-    if (g_lm_brk.n_chunks) {
+    if (g_lm_brk_on && g_lm_brk.n_chunks) {
         uint64_t u = g_lm_brk.n_chunks;
         uint64_t sum_ph = g_lm_brk.t_sd_wait + g_lm_brk.t_xpose_kick +
                           g_lm_brk.t_load + g_lm_brk.t_matmul +
