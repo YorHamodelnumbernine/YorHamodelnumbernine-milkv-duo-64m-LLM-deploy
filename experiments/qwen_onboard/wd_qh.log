@@ -1,0 +1,3 @@
+===== M2 24-layer prefill + LM head (TIU Path A', 3-prompt regression) =====
+[WATCHDOG] QH_INIT_HANG set - spinning main in init window; watchdog should _exit
+[WATCHDOG] heartbeat timeout, force _exit(1) to release ION (prevent orphan 24MB leak)

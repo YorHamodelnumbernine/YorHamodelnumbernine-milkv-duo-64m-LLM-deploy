@@ -1,0 +1,3 @@
+force_mode=0 (0=dynamic, 1-3=fixed), eos_id=0
+[wd] SM_HANG_TEST set — spinning main; watchdog should _exit
+[wd] NO HEARTBEAT >5s - force _exit to release ION
