@@ -67,11 +67,11 @@
 #define GROUPS 7
 #define L 24
 #define V 151936
-#define MS 7            /* max prompt seq in the 3-prompt regression */
-#define MAX_SEQ 64
-#define KV_CAP 48       /* prompt + decode 追加 token 数; 2*DKV*L*4B=24KB/token, 20->48 仅 +0.67MB DDR anon (非 ION) */
-                        /* 依据 PLAN_B_NIB_MEMBUDGET_V2: KV cache 是 malloc(DDR 匿名) 不碰 ION carveout;
-                           DDR 运行期余量 ~5-6MiB 可容 +0.67MiB. MAX_SEQ=64 >= KV_CAP=48 (rope/softmax 上限). */
+#define MS 7            /* max prompt seq in the 3-prompt regression (chunked prefill 每 chunk<=7) */
+#define MAX_SEQ 256     /* INT8 KV: 覆盖扩展上下文上限 (KV_CAP=192 + chunk 边界 + rope 余量) */
+#define KV_CAP 192      /* INT8 KV: 上下文 48->192 (×4), 每 token/层 K+V = 128B int8 x2 + scale 8B,
+                           与 FP32@48 的 24KB/token 内存持平; 依据 DESIGN_INT8_KV per-token 对称量化.
+                           DDR 匿名预算不变 (KV 非 ION). MAX_SEQ=256 >= KV_CAP + MS (rope/softmax 上限). */
 #define TILEW 512       /* max N-tile width (M>=2 pools: 128/256/384/512) */
 #define MAXT 10         /* ceil(F/TILEW) = 10 */
 #define MTILEW 608      /* Phase 7d: merged up/gate N-tile width (F=4864=8*608) */
@@ -1533,19 +1533,22 @@ static void attention(int seq, const float *qbuf, const float *kbuf, const float
 }
 
 /* decode 用: 单个 query (位置 pos, 即 len-1) 对 KV cache 0..len-1 做 attention.
- * k/v 为扁平 [KV_CAP][DKV] cache; 输出 attn[1][D] (只写位置 0). */
-static void attention_cached(int pos, const float *qbuf, const float *k, const float *v,
+ * k/v 为扁平 [KV_CAP][DKV] int8 cache, ksc/vsc 为 per-token scale [KV_CAP].
+ * 反量化内联: K dot 先算 int8 点积再乘 ksc[s] (等价 v'=q*sc 后 dot); V 同理乘 vsc[s]. */
+static void attention_cached(int pos, const float *qbuf,
+                             const int8_t *k, const int8_t *v,
+                             const float *ksc, const float *vsc,
                              float *attn, int len) {
     for (int hh = 0; hh < H; hh++) {
         int kvh = hh / GROUPS;
         const float *qm = qbuf + (size_t)hh * HD;
-        const float *kbase = k + (size_t)kvh * HD;
-        const float *vbase = v + (size_t)kvh * HD;
+        const int8_t *kbase = k + (size_t)kvh * HD;
+        const int8_t *vbase = v + (size_t)kvh * HD;
         float lgm[KV_CAP], mx = -1e30f;
         for (int s = 0; s < len; s++) {
-            const float *ks = kbase + (size_t)s * DKV;
-            float vv = 0; for (int j = 0; j < HD; j++) vv += qm[j] * ks[j];
-            vv *= 1.0f / sqrtf((float)HD);
+            const int8_t *ks = kbase + (size_t)s * DKV;
+            float dot = 0; for (int j = 0; j < HD; j++) dot += qm[j] * (float)ks[j];
+            float vv = dot * (ksc[s] * (1.0f / sqrtf((float)HD)));
             lgm[s] = vv; if (vv > mx) mx = vv;
         }
         float sum = 0;
@@ -1553,7 +1556,7 @@ static void attention_cached(int pos, const float *qbuf, const float *k, const f
         float *attrow = attn + (size_t)hh * HD;
         for (int j = 0; j < HD; j++) {
             float acc = 0;
-            for (int s = 0; s < len; s++) acc += lgm[s] / sum * vbase[(size_t)s * DKV + j];
+            for (int s = 0; s < len; s++) acc += (lgm[s] / sum) * vsc[s] * (float)vbase[(size_t)s * DKV + j];
             attrow[j] = acc;
         }
     }
@@ -1561,10 +1564,13 @@ static void attention_cached(int pos, const float *qbuf, const float *k, const f
 
 /* CHAT 泛化 prefill 用: 每个 chunk token 对「已缓存 KV(0..gpos-1) + 本 chunk kbuf/vbuf」做因果 attention.
  * gpos = 本 chunk 首 token 的全局位置 (进入本 chunk 前的 g_kv_len). 输出 attn[cs][D].
- * gpos==0 时退化为满序列因果 (与现有 attention 逐位一致, 保持回归 bit-exact). */
+ * kcache/vcache 为 [KV_CAP][DKV] int8 + ksc/vsc per-token scale; 缓存部分 (s<gpos) 反量化,
+ * 本 chunk 部分 (s>=gpos) 直接用 fp32 kbuf/vbuf (尚未写入 cache).
+ * gpos==0 时由调用方走 attention() (满序列因果, 保持回归 bit-exact). */
 static void attention_ext(int cs, int gpos,
                           const float *qbuf, const float *kbuf, const float *vbuf,
-                          const float *kcache, const float *vcache, float *attn) {
+                          const int8_t *kcache, const int8_t *vcache,
+                          const float *ksc, const float *vsc, float *attn) {
     for (int hh = 0; hh < H; hh++) {
         int kvh = hh / GROUPS;
         for (int m = 0; m < cs; m++) {
@@ -1572,9 +1578,15 @@ static void attention_ext(int cs, int gpos,
             int len = gpos + m + 1;   /* 该 token 的完整上下文长度 (0..gpos+m) */
             float lgm[MAX_SEQ], mx = -1e30f;
             for (int s = 0; s < len; s++) {
-                const float *ks = (s < gpos) ? kcache + (size_t)kvh * HD + (size_t)s * DKV
-                                             : kbuf   + (size_t)kvh * HD + (size_t)(s - gpos) * DKV;
-                float v = 0; for (int j = 0; j < HD; j++) v += qm[j] * ks[j];
+                float v;
+                if (s < gpos) {
+                    const int8_t *ks = kcache + (size_t)kvh * HD + (size_t)s * DKV;
+                    float dot = 0; for (int j = 0; j < HD; j++) dot += qm[j] * (float)ks[j];
+                    v = dot * ksc[s];
+                } else {
+                    const float *ks = kbuf + (size_t)kvh * HD + (size_t)(s - gpos) * DKV;
+                    v = 0; for (int j = 0; j < HD; j++) v += qm[j] * ks[j];
+                }
                 v *= 1.0f / sqrtf((float)HD);
                 lgm[s] = v; if (v > mx) mx = v;
             }
@@ -1584,9 +1596,14 @@ static void attention_ext(int cs, int gpos,
             for (int j = 0; j < HD; j++) {
                 float acc = 0;
                 for (int s = 0; s < len; s++) {
-                    const float *vs = (s < gpos) ? vcache + (size_t)kvh * HD + (size_t)s * DKV
-                                                 : vbuf   + (size_t)kvh * HD + (size_t)(s - gpos) * DKV;
-                    acc += lgm[s] / sum * vs[j];
+                    float w = lgm[s] / sum;
+                    if (s < gpos) {
+                        const int8_t *vs = vcache + (size_t)kvh * HD + (size_t)s * DKV;
+                        acc += w * vsc[s] * (float)vs[j];
+                    } else {
+                        const float *vs = vbuf + (size_t)kvh * HD + (size_t)(s - gpos) * DKV;
+                        acc += w * vs[j];
+                    }
                 }
                 attrow[j] = acc;
             }
@@ -1597,10 +1614,13 @@ static void attention_ext(int cs, int gpos,
 /* ---------------- buffers ---------------- */
 static float x[MS * D], h[MS * D], qbuf[MS * D], kbuf[MS * DKV], vbuf[MS * DKV], attn[MS * D];
 
-/* ---- KV cache (decode 实测): [L][KV_CAP][DKV], malloc'd 在 main ----
- * prefill 阶段 run_prompt 逐层捕获 kbuf/vbuf 到 cache; decode 阶段逐 token 追加. */
-static float *g_kvk;      /* [L*KV_CAP*DKV] */
-static float *g_kvv;      /* [L*KV_CAP*DKV] */
+/* ---- KV cache (INT8 per-token 对称量化): [L][KV_CAP][DKV] int8 + [L][KV_CAP] scale, malloc'd 在 main ----
+ * prefill 阶段 run_prompt 逐层捕获 kbuf/vbuf 到 cache; decode 阶段逐 token 追加.
+ * 每 token 行独立 scale (per-token), 写用 per_row_quant, 读在 attention_cached/attention_ext 反量化. */
+static int8_t *g_kvk;     /* [L*KV_CAP*DKV] int8 */
+static int8_t *g_kvv;     /* [L*KV_CAP*DKV] int8 */
+static float  *g_kvk_s;   /* [L*KV_CAP] per-token K scale */
+static float  *g_kvv_s;   /* [L*KV_CAP] per-token V scale */
 static int g_kv_len = 0;  /* 已缓存位置数 */
 static int8_t xi[MS * D], ai[MS * D];
 static float scr[MS], sca[MS], sc2[MS];
@@ -1865,18 +1885,20 @@ static void run_prompt(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uint8_t *v
             for (int hh = 0; hh < H; hh++) rope_inplace(qbuf + (size_t)m * D + (size_t)hh * HD, gpos + m, cosb, sinb);
             for (int hh = 0; hh < KVH; hh++) rope_inplace(kbuf + (size_t)m * DKV + (size_t)hh * HD, gpos + m, cosb, sinb);
         }
-        /* ---- KV cache capture (CHAT: 写绝对位置 gpos+m) ---- */
-        for (int m = 0; m < seq; m++) {
-            memcpy(g_kvk + (size_t)(l * KV_CAP + gpos + m) * DKV, kbuf + (size_t)m * DKV, DKV * sizeof(float));
-            memcpy(g_kvv + (size_t)(l * KV_CAP + gpos + m) * DKV, vbuf + (size_t)m * DKV, DKV * sizeof(float));
-        }
+        /* ---- KV cache capture (CHAT: 写绝对位置 gpos+m, INT8 per-token) ---- */
+        per_row_quant(kbuf, seq, DKV, g_kvk + (size_t)(l * KV_CAP + gpos) * DKV,
+                      g_kvk_s + (size_t)l * KV_CAP + gpos);
+        per_row_quant(vbuf, seq, DKV, g_kvv + (size_t)(l * KV_CAP + gpos) * DKV,
+                      g_kvv_s + (size_t)l * KV_CAP + gpos);
         g_kv_len = gpos + seq;
         if (gpos == 0)
             attention(seq, qbuf, kbuf, vbuf, attn);
         else
             attention_ext(seq, gpos, qbuf, kbuf, vbuf,
                           g_kvk + (size_t)l * KV_CAP * DKV,
-                          g_kvv + (size_t)l * KV_CAP * DKV, attn);
+                          g_kvv + (size_t)l * KV_CAP * DKV,
+                          g_kvk_s + (size_t)l * KV_CAP,
+                          g_kvv_s + (size_t)l * KV_CAP, attn);
 
         /* ---- wo ---- */
         per_row_quant(attn, seq, D, ai, sca);
@@ -2003,12 +2025,16 @@ static double run_decode_step(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uin
         for (int j = 0; j < DKV; j++) { kbuf[j] += bk[j]; vbuf[j] += bv[j]; }
         for (int hh = 0; hh < H; hh++) rope_inplace(qbuf + (size_t)hh * HD, pos, cosb, sinb);
         for (int hh = 0; hh < KVH; hh++) rope_inplace(kbuf + (size_t)hh * HD, pos, cosb, sinb);
-        /* 追加 KV 到 cache */
-        memcpy(g_kvk + (size_t)(l * KV_CAP + pos) * DKV, kbuf, DKV * sizeof(float));
-        memcpy(g_kvv + (size_t)(l * KV_CAP + pos) * DKV, vbuf, DKV * sizeof(float));
+        /* 追加 KV 到 cache (INT8 per-token) */
+        per_row_quant(kbuf, 1, DKV, g_kvk + (size_t)(l * KV_CAP + pos) * DKV,
+                      &g_kvk_s[(size_t)l * KV_CAP + pos]);
+        per_row_quant(vbuf, 1, DKV, g_kvv + (size_t)(l * KV_CAP + pos) * DKV,
+                      &g_kvv_s[(size_t)l * KV_CAP + pos]);
         attention_cached(pos, qbuf,
                          g_kvk + (size_t)l * KV_CAP * DKV,
                          g_kvv + (size_t)l * KV_CAP * DKV,
+                         g_kvk_s + (size_t)l * KV_CAP,
+                         g_kvv_s + (size_t)l * KV_CAP,
                          attn, pos + 1);
 
         /* ---- wo + residual ---- */
@@ -2299,14 +2325,18 @@ int main(void) {
         }
     }
 
-    /* ---- KV cache (decode 实测): [L][KV_CAP][DKV] fp32 ---- */
-    g_kvk = malloc((size_t)L * KV_CAP * DKV * sizeof(float));
-    g_kvv = malloc((size_t)L * KV_CAP * DKV * sizeof(float));
-    if (!g_kvk || !g_kvv) { fprintf(stderr, "oom kv cache\n"); return 2; }
-    memset(g_kvk, 0, (size_t)L * KV_CAP * DKV * sizeof(float));
-    memset(g_kvv, 0, (size_t)L * KV_CAP * DKV * sizeof(float));
-    printf("KV cache = %zu B/layer x2 (L=%d KV_CAP=%d DKV=%d)\n",
-           (size_t)KV_CAP * DKV * 4, L, KV_CAP, DKV);
+    /* ---- KV cache (INT8 per-token 对称量化): [L][KV_CAP][DKV] int8 + [L][KV_CAP] scale ---- */
+    g_kvk   = malloc((size_t)L * KV_CAP * DKV);
+    g_kvv   = malloc((size_t)L * KV_CAP * DKV);
+    g_kvk_s = malloc((size_t)L * KV_CAP * sizeof(float));
+    g_kvv_s = malloc((size_t)L * KV_CAP * sizeof(float));
+    if (!g_kvk || !g_kvv || !g_kvk_s || !g_kvv_s) { fprintf(stderr, "oom kv cache\n"); return 2; }
+    memset(g_kvk, 0, (size_t)L * KV_CAP * DKV);
+    memset(g_kvv, 0, (size_t)L * KV_CAP * DKV);
+    memset(g_kvk_s, 0, (size_t)L * KV_CAP * sizeof(float));
+    memset(g_kvv_s, 0, (size_t)L * KV_CAP * sizeof(float));
+    printf("KV cache (INT8 per-token) = %zu B/layer x2 + scale %zu B/layer x2 (L=%d KV_CAP=%d DKV=%d)\n",
+           (size_t)KV_CAP * DKV, (size_t)KV_CAP * 4, L, KV_CAP, DKV);
 
     /* ---- Phase 7/7b: 层权重读路径模式 (LW_READ=mmap|mmap_ra|pread|mmap_db) ---- */
     const char *lw = getenv("LW_READ");
@@ -2399,7 +2429,7 @@ int main(void) {
         if (nd) ndec = atoi(nd);
         if (ndec < 1) ndec = 1;
         if (ndec > KV_CAP - 7) ndec = KV_CAP - 7;   /* prefill 3 + decode <= KV_CAP */
-        printf("==== DECODE 实测: prefill P1(seq=3) + %d decode steps (M=1, KV cache) ====\n", ndec);
+        printf("==== DECODE 实测: prefill P1(seq=3) + %d decode steps (M=1, INT8 KV cache) ====\n", ndec);
         g_kv_len = 0;
         g_ra_err = 0; g_ra_res = 0; g_ra_tot = 0;
         double tl, th; int nxt;
@@ -2463,7 +2493,7 @@ int main(void) {
         if (ndec < 1) ndec = 1;
         if (ndec > KV_CAP - ntok) ndec = KV_CAP - ntok;
 
-        printf("==== CHAT: n_tokens=%d + %d decode steps (KV_CAP=%d, 20->48 +0.67MB DDR anon) ====\n",
+        printf("==== CHAT: n_tokens=%d + %d decode steps (KV_CAP=%d INT8, 48->192 x4 same-mem) ====\n",
                ntok, ndec, KV_CAP);
         g_kv_len = 0;
         g_ra_err = 0; g_ra_res = 0; g_ra_tot = 0;
