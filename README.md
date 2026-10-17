@@ -5,7 +5,11 @@ on-board inference engines for **Qwen2.5-0.5B-Instruct** and
 **SmolLM2-135M-Instruct**.  Built on the
 [cvitek-tdl-sdk](https://github.com/milkv-duo/duo-buildroot-sdk).
 
-## 最新成果（2026-10-17）
+## 最新成果 / Latest Status（2026-10-17）
+
+完整总结（双语全文）：
+[中文版](experiments/qwen_onboard/STATUS_20261017_zh.md) ·
+[English version](experiments/qwen_onboard/STATUS_20261017_en.md)
 
 板上已部署并可运行两个模型（28 MB DDR + 64 MB swap）：
 

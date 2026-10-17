@@ -7,6 +7,9 @@ all phase reports.
 
 Last updated: 2026-10-17 · shipping state: B2 dequant + INT8 KV + two-stage LM head
 
+Latest status summary (bilingual):
+[English](STATUS_20261017_en.md) · [中文](STATUS_20261017_zh.md)
+
 ## Model / engine configuration
 
 | Param | Value |
