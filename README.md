@@ -1,8 +1,36 @@
-# TPU Benchmark & SmolLM2-135M Inference on Milk-V Duo
+# TPU Benchmark & On-Device LLM Inference on Milk-V Duo
 
-CV1800B (C906B @1GHz + C906L @700MHz) TPU/NPU benchmark toolkit and
-SmolLM2-135M dual-core inference engine.  Built on the
+CV1800B (C906B @1GHz + C906L @700MHz) TPU/NPU benchmark toolkit, plus
+on-board inference engines for **Qwen2.5-0.5B-Instruct** and
+**SmolLM2-135M-Instruct**.  Built on the
 [cvitek-tdl-sdk](https://github.com/milkv-duo/duo-buildroot-sdk).
+
+## 最新成果（2026-10-17）
+
+板上已部署并可运行两个模型（28 MB DDR + 64 MB swap）：
+
+| 模型 | 量化 / 权重 | 上下文 | Decode | 状态 |
+|---|---|---|---|---|
+| **Qwen2.5-0.5B-Instruct**（主力） | INT4 G32 K-aligned 权重 + INT8 per-token KV | 192 tok（INT8 KV，48→192 ×4） | **~11.1 s/token** | 出货配置 `mmap + GSC_ION=1` |
+| **SmolLM2-135M-Instruct** | INT8 权重 + INT8 KV | 156 tok | ~4.9 s/token | 早期交付，稳定可运行 |
+
+### Qwen2.5-0.5B-Instruct 关键进展（Phase 6 → B2，2026-08-22）
+
+- **B2 dequant 落地出货**：INT4 nibble `nib[N][16] → nib16[16][N]` 重排 + 连续 `vle8` RVV 内核，
+  单调用吞吐 **1.75×（N=896）/ 2.02×（N=4864）**；端到端 CHAT 75-token prefill
+  **304.5s → 219.6s（↓28%）**，decode **16.25 → 10.98 s/token（↓32%）**。
+- **两段式 LM head**：1.84 MB centroid fp16 常驻 ION（自适应放置，余量不足回退 DDR），
+  Stage2 span pread；head 成本降至 0.5–0.7 s，recall@1 host 复现 11/11。
+- **正确性零退化**：3-prompt NEXT 3/3（2130 / 12095 / 99366）、decode 链 2130→198→32、
+  CHAT 75-token 链逐 token 一致，TIU bit-exact 四项全 0。
+- **ION 看门狗**：init 窗口覆盖 + 原子心跳 + 强制 `_exit(1)`，挂死 ≤ 超时退出、ION 归零无泄漏，
+  正常路径零误杀。
+- **B-P0 权重预取关闭**：`madvise` / `posix_fadvise(DONTNEED)` 在本内核均返回 ENOSYS，
+  无释放机制下预取窗口击穿，实测全负收益（+2.4~+5.0 s/token）。已归档，转 B-P1 独立线程 pread。
+
+当前硬件墙：SD 顺序读 ~20.2 MiB/s、ION carveout 28.1 MB，Qwen 24L decode 理论地板 ~9.45 s，
+11.1 s/token 已接近该约束下的工程极限。详见
+`experiments/qwen_onboard/README.md` 与各 Phase 报告。
 
 ## Directory Layout
 
@@ -12,7 +40,12 @@ tpu_bench/
 │   ├── tpu_bench.h             #   TPU init / matmul / utility wrappers
 │   ├── mha_descriptor.h        #   Multihead-attention shared layout
 │   └── rtos_cmdqu.h            #   Mailbox command-queue userspace defs
-├── smollm2_pool_demo.c         # ★ Main inference: dual-core pipelined
+├── experiments/qwen_onboard/   # ★ Qwen2.5-0.5B on-board engine + Phase reports
+│   ├── qwen_engine_lmhead2.c   #   Shipping engine (INT4 W + INT8 KV + 2-stage LM head)
+│   ├── convert_qwen_kal_b2.py  #   INT4 nib16 re-layout converter
+│   ├── chat_qwen.py            #   Host-side interactive chat wrapper
+│   └── README.md               #   Qwen deployment & results summary
+├── smollm2_pool_demo.c         # SmolLM2 dual-core pipelined engine
 ├── smollm2_demo.c              #   Legacy single-core inference
 ├── convert_smollm2.py          # Convert HF weights → flat INT8 binary
 ├── deploy_v2.py                # Deploy weights & binary to Duo over SSH
@@ -259,6 +292,12 @@ Precise regression: `/root/smollm2_pool_demo <weights> <tokens.bin> 3 3 2`
 - [ ] SDIO access from secondary core (C906L)
 
 ## Phase 8 出货配置与回滚（Qwen 24L 引擎，2026-08-15 签核）
+
+> **2026-08-22 更新**：Phase 8 的读路径/ION 结论仍然有效（`mmap + GSC_ION=1`），
+> 此后 B2 dequant 内核已合入 master（`46eeb78`）并上板验证，decode 由 11.29 s 降至
+> **~11.1 s/token**，CHAT 75-token prefill 降至 219.6 s。回滚二进制中的
+> `qwen_engine_lmhead2_phase7e` 仍可用；当前推荐二进制为 `qwen_engine_lmhead2_b2`。
+> 详见 `REPORT_B2_VERIFY_20260822.md` 与 `experiments/qwen_onboard/README.md`。
 
 Phase 8 收口决定：A'（整层 ion_db 预取 11.72s）与 B-2（per-matrix ion_db 预取）**均未过
 9.5s 验收线**，SD 20.2MiB/s + ION 28.1MB 硬件天花板确认（理论地板 ~9.45s 不可达）。

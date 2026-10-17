@@ -153,6 +153,13 @@ static long g_rsh_bad = 0;     /* 表 vs 运行时扫描 不一致计数 */
 static int g_cur_layer = 0;    /* 当前层 (layer loop 设置) */
 static int g_cur_dchunk = 0;   /* down K-chunk 索引 (非 down = 0) */
 static long g_prev_majflt = 0; /* decode 步内 major fault 计数 (诊断) */
+/* ---- B-P0: 权重预取 (readahead 提前 Δ 层 + DONTNEED 释放已消费层) ----
+ * 仅 LW_MMAP (bare) + B_PREFETCH=1. 把 pass1 冷权重加载的同步页故障转为重叠
+ * 顺序 SD 读. 只 readahead nibble 冷读区 (g_mat_off/len 7 段, 不含 ION 预热 gsc).
+ * 扫测: B_PREFETCH_DELTA={0,6,12} × B_PREFETCH_DONTNEED={0,1}. */
+static int g_b_prefetch = 0, g_b_pf_delta = 6, g_b_pf_dontneed = 0;
+static long g_b_pf_n = 0, g_b_pf_err = 0, g_b_dn_n = 0, g_b_dn_err = 0;
+static double g_t_ra = 0;   /* B-P0 readahead-stall 累计 (含预热, 诊断 mmap_db 式净负) */
 static int rsh_lookup(int l, int mi, int dc) {
     if (l < 0 || l >= L || mi < 0 || mi >= 7) return 5;
     if (mi < 6) return g_rsh[l][mi];
@@ -1428,6 +1435,27 @@ typedef struct {
     size_t lsz;
 } LayerIO;
 
+/* ---- B-P0: 权重预取 helpers (nibble-only readahead / DONTNEED) ----
+ * g_mat_off/g_mat_len = B-2 已验 7 矩阵 nibble 段 (512 对齐); 不含 ION 预热 gsc. */
+static void b_pf_layer(int k) {
+    char path[160]; snprintf(path, sizeof path, "%s/layer%d_kal.bin", WDIR, k);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { g_b_pf_err++; return; }
+    double t0 = now();
+    for (int i = 0; i < NMAT; i++)
+        if (readahead(fd, (off_t)g_mat_off[i], g_mat_len[i]) != 0) g_b_pf_err++;
+    g_t_ra += now() - t0;
+    close(fd); g_b_pf_n++;
+}
+static void b_pf_release(int k) {
+    char path[160]; snprintf(path, sizeof path, "%s/layer%d_kal.bin", WDIR, k);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { g_b_dn_err++; return; }
+    for (int i = 0; i < NMAT; i++)
+        if (posix_fadvise(fd, (off_t)g_mat_off[i], (off_t)g_mat_len[i], POSIX_FADV_DONTNEED) != 0)
+            g_b_dn_err++;
+    close(fd); g_b_dn_n++;
+}
 static int layer_io_begin(int l, size_t lsz, LayerIO *io) {
     char path[160];
     snprintf(path, sizeof path, "%s/layer%d_kal.bin", WDIR, l);
@@ -2006,9 +2034,16 @@ static double run_decode_step(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uin
     }
 
     double t0 = now();
+    double t_ra0 = g_t_ra;   /* B-P0: 本步 readahead-stall 增量基准 */
+    if (g_b_prefetch)        /* B-P0 预热: 头 Δ 层先提交 readahead (否则每步都冷读) */
+        for (int k = 0; k < g_b_pf_delta; k++) b_pf_layer(k);
     for (int l = 0; l < L; l++) {
         wd_kick();   /* watchdog 心跳: 每层打点, 挂死时强制退出防 ION 孤儿泄漏 */
         g_cur_layer = l; g_cur_dchunk = 0;   /* Phase 7c: rsafe 查表定位 (layer, matrix) */
+        if (g_b_prefetch) {
+            if (l + g_b_pf_delta < L) b_pf_layer(l + g_b_pf_delta);   /* 提前 Δ 层预取 nibble */
+            if (g_b_pf_dontneed && l - 2 >= 0) b_pf_release(l - 2);   /* 释放已消费层 (安全窗口≥当前层) */
+        }
         /* 层权重读路径: mmap / mmap+readahead / pread / ion_db (Phase 7, LW_READ) */
         LayerIO lio;
         if (layer_io_begin(l, lsz, &lio) != 0) { fprintf(stderr, "layer_io_begin %d\n", l); exit(2); }
@@ -2104,6 +2139,9 @@ static double run_decode_step(CVI_RT_HANDLE rt, CVI_RT_MEM mem, uint64_t pa, uin
     printf("DECODE pos=%d tok_in=%d next=%d gap=%.4f t_layers=%.2fs t_head=%.2fs (s1=%.3fs s2=%.3fs) cand=%zu total=%.2fs VmSwap=%ldkB majflt=%ld\n",
            pos, tok, top[0], (double)(tv[0] - tv[1]), t_layers, t_rms + t_s1 + t_s2, t_s1, t_s2,
            cand_rows, t_layers + t_rms + t_s1 + t_s2, vmswap_kb(), dmf);
+    if (g_b_prefetch)
+        printf("B-P0: pf_n=%ld pf_err=%ld dn_n=%ld dn_err=%ld t_readahead=%.3fs majflt=%ld\n",
+               g_b_pf_n, g_b_pf_err, g_b_dn_n, g_b_dn_err, g_t_ra - t_ra0, dmf);
     if (g_lw_mode == LW_ION_DB)
         printf("A' metrics: prefetch_n=%d err=%d sd=%.3fs memcpy=%.3fs sd_wait=%.3fs sd_idle=%.3fs(idle_empty=%.3fs noslot=%.3fs reord=%d) (t_layers=%.2fs)\n",
                g_pf_n, g_pf_err, g_t_sd_read, g_t_memcpy, g_t_sd_wait, g_t_sd_idle,
@@ -2368,6 +2406,17 @@ int main(void) {
     else if (lw && !strcmp(lw, "mmap_th")) g_lw_mode = LW_MMAP_TH;
     else if (lw && !strcmp(lw, "ion_db")) g_lw_mode = LW_ION_DB;
     else if (lw && !strcmp(lw, "mmap")) g_lw_mode = LW_MMAP;
+    /* ---- B-P0: 权重预取门控 (B_PREFETCH=1; 仅 LW_MMAP bare 模式生效) ---- */
+    const char *bp = getenv("B_PREFETCH");
+    if (bp && !strcmp(bp, "1") && g_lw_mode == LW_MMAP) {
+        g_b_prefetch = 1;
+        const char *bd = getenv("B_PREFETCH_DELTA");
+        if (bd) g_b_pf_delta = atoi(bd);
+        const char *bn = getenv("B_PREFETCH_DONTNEED");
+        if (bn && !strcmp(bn, "1")) g_b_pf_dontneed = 1;
+        printf("  [B-P0] weight prefetch ON: delta=%d dontneed=%d (mmap bare)\n",
+               g_b_pf_delta, g_b_pf_dontneed);
+    }
     const char *vv = getenv("VERIFY");
     if (vv && !strcmp(vv, "0")) g_verify = 0;
     if (getenv("PROFILE")) g_profile = 1;

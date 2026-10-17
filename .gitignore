@@ -80,6 +80,55 @@ duo_dev.py
 __pycache__/
 *.pyc
 
+# Qwen: large generated artifacts / runtime logs / cross-compiled binaries.
+# Source, scripts and reports are tracked explicitly.
+experiments/qwen_onboard/weights/
+experiments/qwen_onboard/weights_kal/
+experiments/qwen_onboard/weights_kal_b2/
+experiments/qwen_onboard/*.log
+experiments/qwen_onboard/*.out
+experiments/qwen_onboard/*.npz
+experiments/qwen_onboard/qwen_engine_lmhead2
+experiments/qwen_onboard/qwen_engine_lmhead2_*
+experiments/qwen_onboard/qwen_engine_int8kv*
+experiments/qwen_onboard/qwen_engine_24l
+experiments/qwen_onboard/qwen_engine_tiu
+experiments/qwen_onboard/qwen_engine_layer0
+experiments/qwen_onboard/qwen_a1_followup
+experiments/qwen_onboard/lmhead_twostage_c
+experiments/qwen_onboard/lh2_noinline
+experiments/qwen_onboard/bench_*
+experiments/qwen_onboard/dequant_kal_bench*
+experiments/qwen_onboard/layer_read_bench
+experiments/qwen_onboard/stage1_bench
+experiments/qwen_onboard/submit_*
+experiments/qwen_onboard/twopass_matmul
+experiments/qwen_onboard/tier_test.sh
+experiments/qwen_onboard/per_row_quant
+experiments/qwen_onboard/*_probe
+experiments/qwen_onboard/*_probe[0-9]*
+experiments/qwen_onboard/ion_filler
+experiments/qwen_onboard/ion_pmu_test
+experiments/qwen_onboard/merge_diag
+experiments/qwen_onboard/merge_probe
+experiments/qwen_onboard/m1_merge_test
+experiments/qwen_onboard/sd_random_read_bench
+experiments/qwen_onboard/smoke_*.log
+experiments/qwen_onboard/gate_ion*
+experiments/qwen_onboard/qwen_kal_ref
+experiments/qwen_onboard/qwen_lh2_landing
+experiments/qwen_onboard/qwen_m1_chunk*
+experiments/qwen_onboard/*.run
+gate2_realshape
+
+# Qwen INT4 offline analysis: keep scripts/reports, ignore venv/model/wheel/output
+experiments/qwen_int4/.venv/
+experiments/qwen_int4/model/
+experiments/qwen_int4/out/
+experiments/qwen_int4/*.whl
+experiments/qwen_int4/*.log
+experiments/qwen_int4/__pycache__/
+
 # Generated reports
 *.html
 
