@@ -334,4 +334,5 @@ python3 phase7_analyze_logs.py            # 对比表 + 验收线 9.5s 自动判
 
 ## License
 
-MIT
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
+
